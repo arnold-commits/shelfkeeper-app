@@ -72,6 +72,48 @@ const CATEGORY_RULES: Record<string, Record<string, { category: string; subcateg
   'Other': {
     '_default': { category: 'other', subcategory: 'other' },
   },
+
+  // ── ITEM WITHHELD TAX (marketplace facilitator tax) ─────
+  'ItemWithheldTax': {
+    'MarketplaceFacilitatorTax-Principal': { category: 'fee', subcategory: 'marketplace_tax_withheld' },
+    'MarketplaceFacilitatorTax-Shipping': { category: 'fee', subcategory: 'marketplace_tax_withheld' },
+    'MarketplaceFacilitatorVAT-Principal': { category: 'fee', subcategory: 'marketplace_tax_withheld' },
+    'MarketplaceFacilitatorVAT-Shipping': { category: 'fee', subcategory: 'marketplace_tax_withheld' },
+    '_default': { category: 'fee', subcategory: 'tax_withheld' },
+  },
+
+  // ── OTHER TRANSACTIONS (reserves, shipping labels, etc.) ──
+  'other-transaction': {
+    'Current Reserve Amount': { category: 'other', subcategory: 'reserve_hold' },
+    'Previous Reserve Amount Balance': { category: 'other', subcategory: 'reserve_release' },
+    'Subscription Fee': { category: 'fee', subcategory: 'subscription_fee' },
+    'Shipping label purchase': { category: 'fee', subcategory: 'shipping_label_purchase' },
+    'Shipping label purchase for return': { category: 'fee', subcategory: 'shipping_label_return' },
+    'RemovalComplete': { category: 'fee', subcategory: 'fba_removal_fee' },
+    'Adjustment': { category: 'reimbursement', subcategory: 'adjustment' },
+    'FBA Inventory Reimbursement - Customer Return': { category: 'reimbursement', subcategory: 'fba_inventory_reimbursement' },
+    'FBA Inventory Reimbursement - Damaged:Warehouse': { category: 'reimbursement', subcategory: 'fba_inventory_reimbursement' },
+    'FBA Inventory Reimbursement - Lost:Warehouse': { category: 'reimbursement', subcategory: 'fba_inventory_reimbursement' },
+    'Disposal Complete': { category: 'fee', subcategory: 'fba_disposal_fee' },
+    'Manual Processing Fee': { category: 'fee', subcategory: 'manual_processing_fee' },
+    '_default': { category: 'other', subcategory: 'other_transaction' },
+  },
+
+  // ── FBA INVENTORY REIMBURSEMENTS ──────────────────────────
+  'FBA Inventory Reimbursement': {
+    'WAREHOUSE_DAMAGE': { category: 'reimbursement', subcategory: 'fba_warehouse_damage' },
+    'WAREHOUSE_LOST': { category: 'reimbursement', subcategory: 'fba_warehouse_lost' },
+    'CUSTOMER_RETURN': { category: 'reimbursement', subcategory: 'fba_customer_return' },
+    '_default': { category: 'reimbursement', subcategory: 'fba_reimbursement' },
+  },
+
+  // ── COST OF ADVERTISING ──────────────────────────────────
+  'CostOfAdvertising': {
+    '_default': { category: 'fee', subcategory: 'advertising_cost' },
+  },
+  'Cost of Advertising': {
+    '_default': { category: 'fee', subcategory: 'advertising_cost' },
+  },
 };
 
 // Transaction-type level overrides
@@ -108,17 +150,37 @@ const SERVICE_FEE_SUBCATEGORIES: Record<string, string> = {
  * @returns {Object} Parsed result with transactions, summary, and metadata
  */
 export function parseSettlementReport(content: string) {
-  // Detect delimiter (tab for TSV, comma for CSV)
-  const firstLine = content.split('\n')[0];
-  const delimiter = firstLine.includes('\t') ? '\t' : ',';
+  // Remove BOM if present (UTF-8 BOM = \uFEFF after decoding, or raw bytes EF BB BF)
+  content = content.replace(/^\uFEFF/, '').replace(/^\xEF\xBB\xBF/, '');
 
   const lines = content.trim().split('\n');
   if (lines.length < 2) {
     return { error: 'File appears to be empty or has no data rows', transactions: [], summary: null };
   }
 
-  // Parse headers (normalize to lowercase, trim whitespace)
-  const headers = lines[0].split(delimiter).map(h => h.trim().toLowerCase().replace(/["\r]/g, ''));
+  // ── FIND THE ACTUAL HEADER ROW ────────────────────────
+  // Amazon transaction reports have metadata lines at the top.
+  // The header row is the first line that has recognizable column names.
+  let headerLineIndex = 0;
+  const headerPatterns = ['date/time', 'settlement-id', 'settlement id', 'amount-type', 'amount', 'product sales', 'transaction type', 'order id', 'total'];
+
+  for (let i = 0; i < Math.min(lines.length, 20); i++) {
+    const lower = lines[i].toLowerCase().replace(/"/g, '');
+    const matchCount = headerPatterns.filter(p => lower.includes(p)).length;
+    if (matchCount >= 3) {
+      headerLineIndex = i;
+      break;
+    }
+  }
+
+  // Detect delimiter from the header line
+  const headerLine = lines[headerLineIndex];
+  // Count tabs vs commas (commas inside quotes don't count)
+  const tabCount = (headerLine.match(/\t/g) || []).length;
+  const delimiter = tabCount > 3 ? '\t' : ',';
+
+  // Parse headers (normalize to lowercase, trim whitespace and quotes)
+  const headers = parseCSVLine(headerLine, delimiter).map(h => h.trim().toLowerCase().replace(/^"|"$/g, '').replace(/["\r]/g, ''));
 
   // Validate required columns
   const requiredColumns = ['amount-type', 'amount-description', 'amount'];
@@ -129,6 +191,9 @@ export function parseSettlementReport(content: string) {
   headers.forEach((h, i) => {
     const normalized = h.replace(/[-_\s]/g, '').toLowerCase();
     columnMap[normalized] = i;
+    // Also store with original spaces removed but keep slashes
+    const alt = h.replace(/\s+/g, '').toLowerCase();
+    if (alt !== normalized) columnMap[alt] = i;
   });
 
   // Build field index lookup with fallbacks
@@ -147,39 +212,96 @@ export function parseSettlementReport(content: string) {
   }
 
   const COL = {
-    settlementId: findCol('settlement-id'),
-    transactionType: findCol('transaction-type'),
-    orderId: findCol('order-id'),
+    settlementId: findCol('settlement-id') !== -1 ? findCol('settlement-id') : findCol('settlement id'),
+    transactionType: findCol('transaction-type') !== -1 ? findCol('transaction-type') : findCol('type'),
+    orderId: findCol('order-id') !== -1 ? findCol('order-id') : findCol('order id'),
     merchantOrderId: findCol('merchant-order-id'),
     adjustmentId: findCol('adjustment-id'),
     shipmentId: findCol('shipment-id'),
-    marketplaceName: findCol('marketplace-name'),
+    marketplaceName: findCol('marketplace-name') !== -1 ? findCol('marketplace-name') : findCol('marketplace'),
     amountType: findCol('amount-type'),
-    amountDescription: findCol('amount-description'),
+    amountDescription: findCol('amount-description') !== -1 ? findCol('amount-description') : findCol('description'),
     amount: findCol('amount'),
-    quantityPurchased: findCol('quantity-purchased'),
-    postedDate: findCol('posted-date'),
-    postedDateTime: findCol('posted-date-time'),
+    quantityPurchased: findCol('quantity-purchased') !== -1 ? findCol('quantity-purchased') : findCol('quantity'),
+    postedDate: findCol('posted-date') !== -1 ? findCol('posted-date') : findCol('date/time'),
+    postedDateTime: findCol('posted-date-time') !== -1 ? findCol('posted-date-time') : findCol('date/time'),
     sku: findCol('sku'),
     asin: findCol('asin') !== -1 ? findCol('asin') : findCol('fnsku'),
-    fulfillmentId: findCol('fulfillment-id'),
-    orderCity: findCol('order-city'),
-    orderState: findCol('order-state'),
-    orderPostal: findCol('order-postal'),
+    fulfillmentId: findCol('fulfillment-id') !== -1 ? findCol('fulfillment-id') : findCol('fulfillment'),
+    orderCity: findCol('order-city') !== -1 ? findCol('order-city') : findCol('order city'),
+    orderState: findCol('order-state') !== -1 ? findCol('order-state') : findCol('order state'),
+    orderPostal: findCol('order-postal') !== -1 ? findCol('order-postal') : findCol('order postal'),
     depositDate: findCol('deposit-date'),
     settlementStartDate: findCol('settlement-start-date'),
     settlementEndDate: findCol('settlement-end-date'),
-    totalAmount: findCol('total-amount'),
+    totalAmount: findCol('total-amount') !== -1 ? findCol('total-amount') : findCol('total'),
+    // New columns in 2025 reports
+    productName: findCol('description'),
+    accountType: findCol('account-type') !== -1 ? findCol('account-type') : findCol('account type'),
+    transactionStatus: findCol('transaction status'),
+    transactionReleaseDate: findCol('transaction release date'),
   };
 
-  // Validate we have the essential columns
-  if (COL.amount === -1) {
-    return {
-      error: 'Could not find "amount" column. Is this an Amazon settlement report?',
-      transactions: [],
-      summary: null,
-      headers,
-    };
+  // ── DETECT REPORT FORMAT ──────────────────────────────
+  // V2 Flat File: has 'amount-type', 'amount-description', 'amount' columns
+  // V1 Flat File: has individual columns like 'product-sales', 'shipping-credits', 'fba-fees', etc.
+  // Date Range Report: has 'type', 'description', 'total' or similar
+
+  const isV2 = COL.amount !== -1 && COL.amountType !== -1;
+  const isV1 = !isV2 && (findCol('product-sales') !== -1 || findCol('product-sales-tax') !== -1 || findCol('total') !== -1);
+
+  // V1 column map — these are the individual price columns in the old format
+  const V1_COLS: Record<string, { col: number; category: string; subcategory: string }> = {};
+  if (isV1) {
+    const v1Mappings: Array<[string, string, string]> = [
+      ['product-sales', 'income', 'product_sale'],
+      ['product-sales-tax', 'income', 'tax_collected'],
+      ['shipping-credits', 'income', 'shipping_income'],
+      ['shipping-credits-tax', 'income', 'tax_collected'],
+      ['gift-wrap-credits', 'income', 'gift_wrap_income'],
+      ['giftwrap-credits-tax', 'income', 'tax_collected'],
+      ['gift-wrap-credits-tax', 'income', 'tax_collected'],
+      ['giftwrap credits tax', 'income', 'tax_collected'],
+      ['regulatory-fee', 'fee', 'regulatory_fee'],
+      ['regulatory fee', 'fee', 'regulatory_fee'],
+      ['tax-on-regulatory-fee', 'fee', 'regulatory_fee_tax'],
+      ['tax on regulatory fee', 'fee', 'regulatory_fee_tax'],
+      ['promotional-rebates', 'fee', 'promotion_discount'],
+      ['promotional-rebates-tax', 'fee', 'promotion_discount'],
+      ['promotional rebates tax', 'fee', 'promotion_discount'],
+      ['marketplace-withheld-tax', 'fee', 'sales_tax_fee'],
+      ['marketplace withheld tax', 'fee', 'sales_tax_fee'],
+      ['selling-fees', 'fee', 'referral_fee'],
+      ['selling fees', 'fee', 'referral_fee'],
+      ['fba-fees', 'fee', 'fba_fulfillment_fee'],
+      ['fba fees', 'fee', 'fba_fulfillment_fee'],
+      ['other-transaction-fees', 'fee', 'other_fee'],
+      ['other transaction fees', 'fee', 'other_fee'],
+      ['other', 'other', 'other'],
+      ['total', 'other', 'total'],
+    ];
+    for (const [colName, cat, subcat] of v1Mappings) {
+      const idx = findCol(colName);
+      if (idx !== -1) V1_COLS[colName] = { col: idx, category: cat, subcategory: subcat };
+    }
+  }
+
+  // If neither V1 nor V2 detected, try to find any numeric column
+  if (!isV2 && !isV1) {
+    // Check for 'total' column (common in date range reports)
+    const totalCol = findCol('total');
+    if (totalCol !== -1) {
+      // Re-assign amount to total
+      COL.amount = totalCol;
+    } else {
+      // Last resort: find first column with numeric data
+      return {
+        error: 'Could not find "amount" column. This may not be an Amazon settlement report. Supported formats: Flat File V1, Flat File V2, and Date Range Reports. Please download your report from Seller Central → Reports → Payments → All Statements → Download Flat File V2.',
+        transactions: [],
+        summary: null,
+        headers,
+      };
+    }
   }
 
   // Parse rows
@@ -187,7 +309,7 @@ export function parseSettlementReport(content: string) {
   let metadata: any = {};
   let parseErrors: string[] = [];
 
-  for (let i = 1; i < lines.length; i++) {
+  for (let i = headerLineIndex + 1; i < lines.length; i++) {
     const line = lines[i].trim();
     if (!line) continue;
 
@@ -199,34 +321,8 @@ export function parseSettlementReport(content: string) {
       return val || null;
     };
 
-    const amountRaw = getValue(COL.amount);
-    if (!amountRaw && amountRaw !== '0') continue; // Skip header/summary rows with no amount
-
-    // Parse amount (handle EU format with comma as decimal)
-    const amount = parseAmount(amountRaw);
-    if (isNaN(amount)) {
-      // This might be a metadata/header row
-      const settlementId = getValue(COL.settlementId);
-      const depositDate = getValue(COL.depositDate);
-      const startDate = getValue(COL.settlementStartDate);
-      const endDate = getValue(COL.settlementEndDate);
-      const totalAmt = getValue(COL.totalAmount);
-
-      if (settlementId && !metadata.settlementId) {
-        metadata = {
-          settlementId,
-          depositDate: depositDate || null,
-          settlementStartDate: startDate || null,
-          settlementEndDate: endDate || null,
-          totalAmount: parseAmount(totalAmt),
-        };
-      }
-      continue;
-    }
-
+    // Extract common fields
     const transactionType = getValue(COL.transactionType);
-    const amountType = getValue(COL.amountType);
-    const amountDescription = getValue(COL.amountDescription);
     const orderId = getValue(COL.orderId);
     const sku = getValue(COL.sku);
     const asin = getValue(COL.asin);
@@ -235,6 +331,7 @@ export function parseSettlementReport(content: string) {
     const quantityPurchased = parseInt(getValue(COL.quantityPurchased) || '') || null;
     const settlementId = getValue(COL.settlementId);
 
+    // Extract metadata from first rows
     if (!metadata.settlementId && settlementId) {
       metadata.settlementId = settlementId;
       const dd = getValue(COL.depositDate);
@@ -247,30 +344,119 @@ export function parseSettlementReport(content: string) {
       if (ta) metadata.totalAmount = parseAmount(ta);
     }
 
-    // Categorize
-    const { category, subcategory } = categorizeTransaction(
-      transactionType, amountType, amountDescription, amount
-    );
+    if (isV2) {
+      // ── V2 FORMAT: single amount column ────────────────
+      const amountRaw = getValue(COL.amount);
+      if (!amountRaw && amountRaw !== '0') continue;
 
-    transactions.push({
-      settlementId: settlementId || metadata.settlementId,
-      transactionType,
-      orderId,
-      merchantOrderId: getValue(COL.merchantOrderId),
-      adjustmentId: getValue(COL.adjustmentId),
-      shipmentId: getValue(COL.shipmentId),
-      marketplaceName: getValue(COL.marketplaceName),
-      amountType,
-      amountDescription,
-      amount,
-      quantityPurchased,
-      postedDate: normalizeDate(postedDate),
-      postedDateTime: postedDateTime || null,
-      sku,
-      asin,
-      category,
-      subcategory,
-    });
+      const amount = parseAmount(amountRaw);
+      if (isNaN(amount)) continue;
+
+      const amountType = getValue(COL.amountType);
+      const amountDescription = getValue(COL.amountDescription);
+
+      const { category, subcategory } = categorizeTransaction(
+        transactionType, amountType, amountDescription, amount
+      );
+
+      transactions.push({
+        settlementId: settlementId || metadata.settlementId,
+        transactionType, orderId,
+        merchantOrderId: getValue(COL.merchantOrderId),
+        adjustmentId: getValue(COL.adjustmentId),
+        shipmentId: getValue(COL.shipmentId),
+        marketplaceName: getValue(COL.marketplaceName),
+        amountType, amountDescription, amount, quantityPurchased,
+        postedDate: normalizeDate(postedDate),
+        postedDateTime: postedDateTime || null,
+        sku, asin, category, subcategory,
+      });
+
+    } else if (isV1) {
+      // ── V1 FORMAT: separate column per fee/income type ──
+      // Each row has multiple amount columns — create one transaction per non-zero column
+      let hasAnyAmount = false;
+
+      for (const [colName, info] of Object.entries(V1_COLS)) {
+        const raw = getValue(info.col);
+        if (!raw || raw === '0' || raw === '0.00') continue;
+        const amount = parseAmount(raw);
+        if (isNaN(amount) || amount === 0) continue;
+
+        hasAnyAmount = true;
+
+        // Skip the 'total' column — it's just a sum of the others
+        if (colName === 'total') continue;
+
+        transactions.push({
+          settlementId: settlementId || metadata.settlementId,
+          transactionType: transactionType || 'Order',
+          orderId,
+          merchantOrderId: getValue(COL.merchantOrderId),
+          adjustmentId: getValue(COL.adjustmentId),
+          shipmentId: getValue(COL.shipmentId),
+          marketplaceName: getValue(COL.marketplaceName),
+          amountType: colName,
+          amountDescription: colName,
+          amount, quantityPurchased,
+          postedDate: normalizeDate(postedDate),
+          postedDateTime: postedDateTime || null,
+          sku, asin,
+          category: info.category,
+          subcategory: info.subcategory,
+        });
+      }
+
+      // If no individual columns had data, try the 'total' column as fallback
+      if (!hasAnyAmount && V1_COLS['total']) {
+        const totalRaw = getValue(V1_COLS['total'].col);
+        if (totalRaw) {
+          const amount = parseAmount(totalRaw);
+          if (!isNaN(amount) && amount !== 0) {
+            const { category, subcategory } = categorizeTransaction(
+              transactionType, null, null, amount
+            );
+            transactions.push({
+              settlementId: settlementId || metadata.settlementId,
+              transactionType, orderId,
+              merchantOrderId: getValue(COL.merchantOrderId),
+              adjustmentId: null, shipmentId: null,
+              marketplaceName: getValue(COL.marketplaceName),
+              amountType: 'total', amountDescription: 'total',
+              amount, quantityPurchased,
+              postedDate: normalizeDate(postedDate),
+              postedDateTime: postedDateTime || null,
+              sku, asin, category, subcategory,
+            });
+          }
+        }
+      }
+
+    } else {
+      // ── FALLBACK: single amount column (date range reports) ──
+      const amountRaw = getValue(COL.amount);
+      if (!amountRaw) continue;
+      const amount = parseAmount(amountRaw);
+      if (isNaN(amount)) continue;
+
+      const { category, subcategory } = categorizeTransaction(
+        transactionType, getValue(COL.amountType), getValue(COL.amountDescription), amount
+      );
+
+      transactions.push({
+        settlementId: settlementId || metadata.settlementId,
+        transactionType, orderId,
+        merchantOrderId: getValue(COL.merchantOrderId),
+        adjustmentId: null, shipmentId: null,
+        marketplaceName: getValue(COL.marketplaceName),
+        amountType: getValue(COL.amountType) || 'unknown',
+        amountDescription: getValue(COL.amountDescription) || 'unknown',
+        amount, quantityPurchased,
+        postedDate: normalizeDate(postedDate),
+        postedDateTime: postedDateTime || null,
+        sku, asin, category, subcategory,
+      });
+    }
   }
 
   // Build summary
@@ -510,8 +696,19 @@ function parseAmount(raw: any) {
 
 function normalizeDate(raw: any) {
   if (!raw) return null;
-  // Handle multiple formats
-  // MM/DD/YY
+  // Remove quotes
+  raw = raw.replace(/^"|"$/g, '').trim();
+
+  // Amazon verbose format: "Jan 1, 2025 10:17:52 AM PST"
+  const MONTHS: Record<string, string> = { jan:'01', feb:'02', mar:'03', apr:'04', may:'05', jun:'06', jul:'07', aug:'08', sep:'09', oct:'10', nov:'11', dec:'12' };
+  const verboseMatch = raw.match(/^([A-Za-z]{3})\s+(\d{1,2}),?\s+(\d{4})/);
+  if (verboseMatch) {
+    const [, mon, d, y] = verboseMatch;
+    const m = MONTHS[mon.toLowerCase()];
+    if (m) return `${y}-${m}-${d.padStart(2, '0')}`;
+  }
+
+  // MM/DD/YY or MM/DD/YYYY
   const mdyMatch = raw.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
   if (mdyMatch) {
     let [, m, d, y] = mdyMatch;

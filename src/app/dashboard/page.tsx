@@ -216,82 +216,81 @@ export default function Dashboard() {
 
   // File upload handler
   const handleFileUpload = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file || !user) return;
+    const files = e.target.files;
+    if (!files || files.length === 0 || !user) return;
 
     setUploading(true);
-    setUploadMsg("Parsing settlement report...");
+    const totalFiles = files.length;
+    let successCount = 0;
+    let totalTxCount = 0;
 
-    try {
-      const text = await file.text();
-      const result = parseSettlementReport(text) as ParseResult;
+    for (let f = 0; f < totalFiles; f++) {
+      const file = files[f];
+      setUploadMsg(`Processing file ${f + 1} of ${totalFiles}: ${file.name}...`);
 
-      if (result.error) {
-        setUploadMsg(`Error: ${result.error}`);
-        setUploading(false);
-        return;
+      try {
+        const text = await file.text();
+        const result = parseSettlementReport(text) as ParseResult;
+
+        if (result.error) {
+          setUploadMsg(`File ${f + 1}/${totalFiles} error: ${result.error}. Skipping...`);
+          await new Promise(r => setTimeout(r, 1500));
+          continue;
+        }
+
+        // Insert report
+        const { data: report, error: reportErr } = await supabase
+          .from("settlement_reports")
+          .insert({
+            user_id: user.id,
+            filename: file.name,
+            settlement_id: result.metadata?.settlementId,
+            settlement_start_date: result.metadata?.settlementStartDate,
+            settlement_end_date: result.metadata?.settlementEndDate,
+            deposit_date: result.metadata?.depositDate,
+            total_amount: result.metadata?.totalAmount,
+            row_count: result.rowCount,
+            status: "completed",
+            processed_at: new Date().toISOString(),
+          })
+          .select()
+          .single();
+
+        if (reportErr) { setUploadMsg(`File ${f + 1} DB error: ${reportErr.message}`); continue; }
+
+        // Batch insert transactions
+        const txRows = result.transactions.map((tx: any) => ({
+          user_id: user.id, report_id: report.id,
+          settlement_id: tx.settlementId, transaction_type: tx.transactionType,
+          order_id: tx.orderId, merchant_order_id: tx.merchantOrderId,
+          adjustment_id: tx.adjustmentId, shipment_id: tx.shipmentId,
+          marketplace_name: tx.marketplaceName, amount_type: tx.amountType,
+          amount_description: tx.amountDescription, amount: tx.amount,
+          quantity_purchased: tx.quantityPurchased,
+          posted_date: tx.postedDate, posted_date_time: tx.postedDateTime,
+          sku: tx.sku, asin: tx.asin,
+          category: tx.category, subcategory: tx.subcategory,
+        }));
+
+        for (let i = 0; i < txRows.length; i += 500) {
+          await supabase.from("settlement_transactions").insert(txRows.slice(i, i + 500));
+        }
+
+        successCount++;
+        totalTxCount += result.rowCount;
+        setUploadMsg(`File ${f + 1}/${totalFiles} done (${result.rowCount} txns). Total so far: ${totalTxCount}`);
+      } catch (err: any) {
+        setUploadMsg(`File ${f + 1} error: ${err.message}. Continuing...`);
+        await new Promise(r => setTimeout(r, 1000));
       }
+    }
 
-      setUploadMsg(`Found ${result.rowCount} transactions. Saving to database...`);
-
-      // Insert report
-      const { data: report, error: reportErr } = await supabase
-        .from("settlement_reports")
-        .insert({
-          user_id: user.id,
-          filename: file.name,
-          settlement_id: result.metadata?.settlementId,
-          settlement_start_date: result.metadata?.settlementStartDate,
-          settlement_end_date: result.metadata?.settlementEndDate,
-          deposit_date: result.metadata?.depositDate,
-          total_amount: result.metadata?.totalAmount,
-          row_count: result.rowCount,
-          status: "completed",
-          processed_at: new Date().toISOString(),
-        })
-        .select()
-        .single();
-
-      if (reportErr) throw reportErr;
-
-      // Batch insert transactions (chunks of 500)
-      const txRows = result.transactions.map((tx: any) => ({
-        user_id: user.id,
-        report_id: report.id,
-        settlement_id: tx.settlementId,
-        transaction_type: tx.transactionType,
-        order_id: tx.orderId,
-        merchant_order_id: tx.merchantOrderId,
-        adjustment_id: tx.adjustmentId,
-        shipment_id: tx.shipmentId,
-        marketplace_name: tx.marketplaceName,
-        amount_type: tx.amountType,
-        amount_description: tx.amountDescription,
-        amount: tx.amount,
-        quantity_purchased: tx.quantityPurchased,
-        posted_date: tx.postedDate,
-        posted_date_time: tx.postedDateTime,
-        sku: tx.sku,
-        asin: tx.asin,
-        category: tx.category,
-        subcategory: tx.subcategory,
-      }));
-
-      for (let i = 0; i < txRows.length; i += 500) {
-        const chunk = txRows.slice(i, i + 500);
-        const { error: txErr } = await supabase.from("settlement_transactions").insert(chunk);
-        if (txErr) throw txErr;
-        setUploadMsg(`Saved ${Math.min(i + 500, txRows.length)} of ${txRows.length} transactions...`);
-      }
-
-      setUploadMsg(`Done! ${result.rowCount} transactions imported.`);
+    setUploadMsg(`Complete! ${successCount}/${totalFiles} files imported with ${totalTxCount} total transactions.`);
+    if (successCount > 0) {
       setShowUpload(false);
       await loadData();
-    } catch (err: any) {
-      setUploadMsg(`Error: ${err.message}`);
-    } finally {
-      setUploading(false);
     }
+    setUploading(false);
   }, [user, supabase]);
 
   // Add expense
@@ -380,10 +379,10 @@ export default function Dashboard() {
           <div className="max-w-xl mx-auto">
             <label className="block border-2 border-dashed border-gray-700 hover:border-indigo-500 rounded-xl p-8 text-center cursor-pointer transition">
               <Upload size={32} className="mx-auto mb-3 text-gray-500" />
-              <div className="font-semibold mb-1">Drop your Amazon Settlement Report</div>
-              <div className="text-sm text-gray-500 mb-2">Seller Central → Reports → Payments → Download Flat File V2</div>
-              <div className="text-sm text-gray-600">Supports TSV and CSV</div>
-              <input type="file" accept=".tsv,.csv,.txt" onChange={handleFileUpload} className="hidden" disabled={uploading} />
+              <div className="font-semibold mb-1">Drop your Amazon Settlement Reports</div>
+              <div className="text-sm text-gray-500 mb-2">Select ALL files at once — Seller Central → Reports → Payments → Download Flat File</div>
+              <div className="text-sm text-gray-600">Supports V1 Flat File, V2 Flat File, and Date Range Reports (TSV/CSV)</div>
+              <input type="file" accept=".tsv,.csv,.txt" onChange={handleFileUpload} className="hidden" disabled={uploading} multiple />
             </label>
             {uploadMsg && (
               <div className={`mt-3 text-sm text-center ${uploadMsg.startsWith("Error") ? "text-red-400" : uploadMsg.startsWith("Done") ? "text-green-400" : "text-indigo-400"}`}>
