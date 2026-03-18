@@ -12,8 +12,9 @@ type ParseResult = {
   rowCount: number;
 };
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from "recharts";
-import { Upload, FileText, TrendingUp, DollarSign, AlertTriangle, Package, MessageSquare, Plus, Download, LogOut, ChevronDown, BarChart3 } from "lucide-react";
+import { Upload, FileText, TrendingUp, DollarSign, AlertTriangle, Package, MessageSquare, Plus, Download, LogOut, ChevronDown, BarChart3, Landmark, CheckCircle, XCircle, Split, Eye } from "lucide-react";
 import Link from "next/link";
+import { parseBankStatement } from "@/lib/bank-parser";
 
 // ── FORMATTING HELPERS ─────────────────────────────────
 const fmt = (n: number) => new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(n);
@@ -61,6 +62,15 @@ export default function Dashboard() {
   // Balance sheet
   const [balanceSheet, setBalanceSheet] = useState<any>(null);
 
+  // Bank transactions
+  const [bankTxns, setBankTxns] = useState<any[]>([]);
+  const [bankFilter, setBankFilter] = useState<"all" | "unreviewed" | "business" | "personal">("all");
+  const [bankUploading, setBankUploading] = useState(false);
+  const [bankMsg, setBankMsg] = useState("");
+
+  // Reconciliation
+  const [reconData, setReconData] = useState<any>(null);
+
   const supabase = createClient();
 
   // Check auth
@@ -76,6 +86,8 @@ export default function Dashboard() {
     loadData();
     loadExpenses();
     loadBalanceSheet();
+    loadBankTransactions();
+    loadReconciliation();
   }, [user]);
 
   const loadData = async () => {
@@ -129,6 +141,78 @@ export default function Dashboard() {
     const { data } = await supabase.from("v_balance_sheet").select("*").limit(1);
     if (data && data.length > 0) setBalanceSheet(data[0]);
   };
+
+  const loadBankTransactions = async () => {
+    const { data } = await supabase
+      .from("bank_transactions")
+      .select("*, bank_imports(account_name, account_type)")
+      .order("date", { ascending: false })
+      .limit(500);
+    if (data) setBankTxns(data);
+  };
+
+  const loadReconciliation = async () => {
+    const { data } = await supabase.from("v_accrual_vs_cash").select("*").order("month", { ascending: false }).limit(12);
+    if (data) setReconData(data);
+  };
+
+  // Bank CSV upload handler
+  const handleBankUpload = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file || !user) return;
+    setBankUploading(true);
+    setBankMsg("Parsing bank statement...");
+    try {
+      const text = await file.text();
+      const result = parseBankStatement(text);
+      if (result.error) { setBankMsg(`Error: ${result.error}`); setBankUploading(false); return; }
+      setBankMsg(`Found ${result.rowCount} transactions (${result.bankDetected}). Saving...`);
+
+      const { data: bankImport, error: impErr } = await supabase
+        .from("bank_imports")
+        .insert({ user_id: user.id, filename: file.name, account_name: file.name.replace(/\.[^.]+$/, ''), account_type: result.accountType, row_count: result.rowCount, status: "completed" })
+        .select().single();
+      if (impErr) throw impErr;
+
+      const txRows = result.transactions.map((tx: any) => ({
+        user_id: user.id, import_id: bankImport.id, date: tx.date, description: tx.description,
+        amount: tx.amount, balance: tx.balance, transaction_type: tx.type,
+        ai_category_suggestion: tx.suggestedCategory, ai_confidence: tx.confidence,
+        category_suggestion: tx.suggestedCategory,
+      }));
+
+      for (let i = 0; i < txRows.length; i += 500) {
+        await supabase.from("bank_transactions").insert(txRows.slice(i, i + 500));
+        setBankMsg(`Saved ${Math.min(i + 500, txRows.length)} of ${txRows.length}...`);
+      }
+      setBankMsg(`Done! ${result.rowCount} transactions imported.`);
+      await loadBankTransactions();
+    } catch (err: any) { setBankMsg(`Error: ${err.message}`); }
+    finally { setBankUploading(false); }
+  }, [user, supabase]);
+
+  // Tag bank transaction as business/personal/split
+  const tagTransaction = async (txId: string, isBusiness: boolean | null, splitAmount?: number) => {
+    const update: any = { is_business: isBusiness, manually_reviewed: true, reviewed_at: new Date().toISOString() };
+    if (splitAmount !== undefined) update.split_amount = splitAmount;
+    await supabase.from("bank_transactions").update(update).eq("id", txId);
+    setBankTxns(prev => prev.map(t => t.id === txId ? { ...t, ...update } : t));
+  };
+
+  // Filtered bank transactions
+  const filteredBankTxns = useMemo(() => {
+    if (bankFilter === "all") return bankTxns;
+    if (bankFilter === "unreviewed") return bankTxns.filter(t => t.is_business === null);
+    if (bankFilter === "business") return bankTxns.filter(t => t.is_business === true);
+    return bankTxns.filter(t => t.is_business === false);
+  }, [bankTxns, bankFilter]);
+
+  const bankStats = useMemo(() => ({
+    total: bankTxns.length,
+    unreviewed: bankTxns.filter(t => t.is_business === null).length,
+    business: bankTxns.filter(t => t.is_business === true).length,
+    personal: bankTxns.filter(t => t.is_business === false).length,
+  }), [bankTxns]);
 
   // File upload handler
   const handleFileUpload = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -263,6 +347,8 @@ export default function Dashboard() {
     { id: "dashboard", label: "Dashboard", icon: TrendingUp },
     { id: "products", label: "Products", icon: Package },
     { id: "fees", label: "Fees", icon: DollarSign },
+    { id: "banking", label: "Banking", icon: Landmark },
+    { id: "reconcile", label: "Reconcile", icon: CheckCircle },
     { id: "balance", label: "Balance Sheet", icon: BarChart3 },
     { id: "expenses", label: "Expenses", icon: FileText },
     { id: "ask", label: "Ask AI", icon: MessageSquare },
@@ -459,6 +545,176 @@ export default function Dashboard() {
               </>
             ) : (
               <div className="text-center py-16 text-gray-500">Upload a settlement report to see fee analysis.</div>
+            )}
+          </div>
+        )}
+
+        {/* ── BANKING TAB (Upload + Transaction Review) ── */}
+        {tab === "banking" && (
+          <div>
+            <div className="flex justify-between items-center mb-4">
+              <div>
+                <h2 className="text-lg font-bold">Bank & Credit Card Transactions</h2>
+                <p className="text-sm text-gray-500">Upload CSV statements, tag business vs personal, auto-categorize</p>
+              </div>
+            </div>
+
+            {/* Bank upload */}
+            <div className="bg-[#111827] border border-gray-800 rounded-xl p-4 mb-4">
+              <label className="block border-2 border-dashed border-gray-700 hover:border-indigo-500 rounded-lg p-6 text-center cursor-pointer transition">
+                <Landmark size={24} className="mx-auto mb-2 text-gray-500" />
+                <div className="text-sm font-medium mb-1">Upload bank or credit card CSV</div>
+                <div className="text-xs text-gray-500">Supports Chase, Bank of America, Wells Fargo, Capital One, and generic CSV</div>
+                <input type="file" accept=".csv,.tsv,.txt" onChange={handleBankUpload} className="hidden" disabled={bankUploading} />
+              </label>
+              {bankMsg && <div className={`mt-2 text-sm text-center ${bankMsg.startsWith("Error") ? "text-red-400" : bankMsg.startsWith("Done") ? "text-emerald-400" : "text-indigo-400"}`}>{bankMsg}</div>}
+            </div>
+
+            {/* Stats bar */}
+            {bankTxns.length > 0 && (
+              <div className="flex gap-2 mb-4">
+                {([
+                  { key: "all" as const, label: `All (${bankStats.total})`, color: "" },
+                  { key: "unreviewed" as const, label: `Needs review (${bankStats.unreviewed})`, color: "text-amber-400" },
+                  { key: "business" as const, label: `Business (${bankStats.business})`, color: "text-emerald-400" },
+                  { key: "personal" as const, label: `Personal (${bankStats.personal})`, color: "text-red-400" },
+                ]).map(f => (
+                  <button key={f.key} onClick={() => setBankFilter(f.key)}
+                    className={`px-3 py-1.5 rounded-lg text-xs font-medium transition ${bankFilter === f.key ? "bg-indigo-600 text-white" : `bg-gray-800 ${f.color || "text-gray-400"} hover:bg-gray-700`}`}>
+                    {f.label}
+                  </button>
+                ))}
+              </div>
+            )}
+
+            {/* Transaction list */}
+            {filteredBankTxns.length > 0 ? (
+              <div className="space-y-1">
+                {filteredBankTxns.map((tx: any) => (
+                  <div key={tx.id} className={`bg-[#111827] border rounded-xl px-4 py-3 flex items-center gap-3 ${
+                    tx.is_business === null ? "border-amber-800/30" : tx.is_business ? "border-gray-800" : "border-gray-800 opacity-50"
+                  }`}>
+                    {/* Date */}
+                    <div className="text-xs font-mono text-gray-500 w-16 shrink-0">{tx.date?.slice(5)}</div>
+
+                    {/* Description + AI suggestion */}
+                    <div className="flex-1 min-w-0">
+                      <div className="text-sm font-medium truncate">{tx.description}</div>
+                      <div className="text-xs text-gray-500">
+                        {tx.ai_category_suggestion ? (
+                          <span className="text-indigo-400">{tx.ai_category_suggestion}</span>
+                        ) : (
+                          <span className="text-gray-600 italic">No category match</span>
+                        )}
+                        {tx.bank_imports?.account_name && <span className="ml-2 text-gray-600">· {tx.bank_imports.account_name}</span>}
+                      </div>
+                    </div>
+
+                    {/* Amount */}
+                    <div className={`text-sm font-mono font-semibold w-24 text-right shrink-0 ${Number(tx.amount) >= 0 ? "text-emerald-400" : "text-red-400"}`}>
+                      {fmt(Number(tx.amount))}
+                    </div>
+
+                    {/* Tag buttons */}
+                    <div className="flex gap-1 shrink-0">
+                      <button onClick={() => tagTransaction(tx.id, true)}
+                        className={`px-2 py-1 rounded text-xs font-medium transition ${tx.is_business === true ? "bg-emerald-600 text-white" : "bg-gray-800 text-gray-400 hover:bg-emerald-900 hover:text-emerald-400"}`}
+                        title="Business">
+                        <CheckCircle size={14} />
+                      </button>
+                      <button onClick={() => tagTransaction(tx.id, false)}
+                        className={`px-2 py-1 rounded text-xs font-medium transition ${tx.is_business === false ? "bg-red-600 text-white" : "bg-gray-800 text-gray-400 hover:bg-red-900 hover:text-red-400"}`}
+                        title="Personal">
+                        <XCircle size={14} />
+                      </button>
+                      <button onClick={() => {
+                        const pct = prompt("Business percentage (e.g. 60 for 60%):");
+                        if (pct) tagTransaction(tx.id, true, Number(tx.amount) * (Number(pct) / 100));
+                      }}
+                        className="px-2 py-1 rounded text-xs font-medium bg-gray-800 text-gray-400 hover:bg-amber-900 hover:text-amber-400 transition"
+                        title="Split (partial business)">
+                        <Split size={14} />
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="text-center py-16 text-gray-500 text-sm">
+                {bankTxns.length === 0 ? "Upload a bank or credit card CSV to start reviewing transactions." : "No transactions match this filter."}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ── RECONCILIATION TAB ─────────────────────── */}
+        {tab === "reconcile" && (
+          <div>
+            <h2 className="text-lg font-bold mb-1">Bank Reconciliation</h2>
+            <p className="text-sm text-gray-500 mb-6">Accrual vs cash basis — matches Amazon settlements to bank deposits</p>
+
+            {reconData && reconData.length > 0 ? (
+              <div className="space-y-3">
+                {/* Accrual vs Cash chart */}
+                <div className="bg-[#111827] border border-gray-800 rounded-xl p-5 mb-4">
+                  <div className="text-sm font-semibold mb-4">Monthly: accrual income vs cash deposits</div>
+                  <ResponsiveContainer width="100%" height={220}>
+                    <BarChart data={[...reconData].reverse()}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
+                      <XAxis dataKey="month" tick={{ fontSize: 11, fill: "#64748b" }} tickFormatter={(v: string) => v?.slice(5, 7) + '/' + v?.slice(2, 4)} />
+                      <YAxis tick={{ fontSize: 11, fill: "#64748b" }} tickFormatter={(v: number) => `$${(v / 1000).toFixed(0)}k`} />
+                      <Tooltip formatter={(v: number) => fmt(v)} contentStyle={{ background: "#1e293b", border: "1px solid #334155", borderRadius: 8, fontSize: 13 }} />
+                      <Bar dataKey="accrual_net" fill="#818cf8" radius={[4, 4, 0, 0]} name="Accrual (when sold)" />
+                      <Bar dataKey="cash_deposits" fill="#10b981" radius={[4, 4, 0, 0]} name="Cash (when deposited)" />
+                    </BarChart>
+                  </ResponsiveContainer>
+                </div>
+
+                {/* Monthly detail */}
+                {reconData.map((row: any, i: number) => {
+                  const diff = Number(row.timing_difference);
+                  const status = row.reconciliation_status;
+                  return (
+                    <div key={i} className="bg-[#111827] border border-gray-800 rounded-xl p-4">
+                      <div className="flex justify-between items-center mb-3">
+                        <div className="text-sm font-semibold">{new Date(row.month + 'T12:00:00').toLocaleDateString("en-US", { month: "long", year: "numeric" })}</div>
+                        <span className={`px-2 py-0.5 rounded text-xs font-medium ${
+                          status === "matched" ? "bg-emerald-900/30 text-emerald-400" :
+                          status === "timing_gap" ? "bg-amber-900/30 text-amber-400" :
+                          "bg-gray-800 text-gray-400"
+                        }`}>
+                          {status === "matched" ? "Reconciled" : status === "timing_gap" ? "Timing gap" : status}
+                        </span>
+                      </div>
+                      <div className="grid grid-cols-3 gap-4 text-center">
+                        <div>
+                          <div className="text-xs text-gray-500 mb-1">Accrual income</div>
+                          <div className="text-sm font-mono font-semibold text-indigo-400">{fmt(Number(row.accrual_net))}</div>
+                        </div>
+                        <div>
+                          <div className="text-xs text-gray-500 mb-1">Cash deposited</div>
+                          <div className="text-sm font-mono font-semibold text-emerald-400">{fmt(Number(row.cash_deposits))}</div>
+                        </div>
+                        <div>
+                          <div className="text-xs text-gray-500 mb-1">Timing difference</div>
+                          <div className={`text-sm font-mono font-semibold ${Math.abs(diff) < 1 ? "text-emerald-400" : "text-amber-400"}`}>
+                            {fmt(diff)}
+                          </div>
+                        </div>
+                      </div>
+                      {Math.abs(diff) > 1 && (
+                        <div className="mt-3 px-3 py-2 bg-indigo-500/5 border border-indigo-500/20 rounded-lg text-xs text-gray-400">
+                          Adjusting entry: DR Accounts Receivable {fmt(Math.abs(diff))} / CR Revenue {fmt(Math.abs(diff))}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            ) : (
+              <div className="text-center py-16 text-gray-500 text-sm">
+                Upload settlement reports and bank statements to see reconciliation. The system matches Amazon deposits to bank transactions automatically.
+              </div>
             )}
           </div>
         )}
