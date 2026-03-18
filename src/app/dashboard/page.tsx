@@ -71,6 +71,9 @@ export default function Dashboard() {
   // Reconciliation
   const [reconData, setReconData] = useState<any>(null);
 
+  // P&L Statement
+  const [pnlData, setPnlData] = useState<any>(null);
+
   const supabase = createClient();
 
   // Check auth
@@ -88,6 +91,7 @@ export default function Dashboard() {
     loadBalanceSheet();
     loadBankTransactions();
     loadReconciliation();
+    loadPnl();
   }, [user]);
 
   const loadData = async () => {
@@ -154,6 +158,11 @@ export default function Dashboard() {
   const loadReconciliation = async () => {
     const { data } = await supabase.from("v_accrual_vs_cash").select("*").order("month", { ascending: false }).limit(12);
     if (data) setReconData(data);
+  };
+
+  const loadPnl = async () => {
+    const { data } = await supabase.from("v_profit_loss_statement").select("*").limit(1);
+    if (data && data.length > 0) setPnlData(data[0]);
   };
 
   // Bank CSV upload handler
@@ -344,6 +353,7 @@ export default function Dashboard() {
 
   const tabs = [
     { id: "dashboard", label: "Dashboard", icon: TrendingUp },
+    { id: "pnl", label: "P&L", icon: FileText },
     { id: "products", label: "Products", icon: Package },
     { id: "fees", label: "Fees", icon: DollarSign },
     { id: "banking", label: "Banking", icon: Landmark },
@@ -469,6 +479,160 @@ export default function Dashboard() {
                   ))}
                 </div>
               </div>
+            )}
+          </div>
+        )}
+
+        {/* ── P&L STATEMENT TAB ──────────────────────── */}
+        {tab === "pnl" && (
+          <div>
+            <h2 className="text-lg font-bold mb-1">Profit & Loss Statement</h2>
+            <p className="text-sm text-gray-500 mb-6">Tax Year {pnlData?.tax_year || 2025} — PaulaDLLC</p>
+
+            {pnlData ? (
+              <div className="space-y-4">
+                {/* REVENUE */}
+                <div className="bg-[#111827] border border-gray-800 rounded-xl p-5">
+                  <div className="text-xs font-bold text-emerald-400 uppercase tracking-wider mb-4">Revenue</div>
+                  {[
+                    { label: "Product sales", value: Number(pnlData.product_sales) },
+                    { label: "Shipping income", value: Number(pnlData.shipping_income) },
+                    { label: "Gift wrap income", value: Number(pnlData.gift_wrap_income) },
+                    { label: "Reimbursements", value: Number(pnlData.reimbursements) },
+                    { label: "Returns & refunds", value: Number(pnlData.returns_refunds) },
+                  ].map(row => (
+                    <div key={row.label} className="flex justify-between py-1.5 border-b border-gray-800/50">
+                      <span className="text-sm text-gray-300">{row.label}</span>
+                      <span className={`text-sm font-mono ${row.value >= 0 ? "text-gray-200" : "text-red-400"}`}>{fmt(row.value)}</span>
+                    </div>
+                  ))}
+                  <div className="flex justify-between pt-3 mt-2 border-t-2 border-emerald-800">
+                    <span className="text-sm font-bold text-emerald-400">GROSS REVENUE</span>
+                    <span className="text-base font-bold font-mono text-emerald-400">{fmt(Number(pnlData.gross_revenue))}</span>
+                  </div>
+                </div>
+
+                {/* COGS */}
+                <div className="bg-[#111827] border border-gray-800 rounded-xl p-5">
+                  <div className="text-xs font-bold text-amber-400 uppercase tracking-wider mb-4">Cost of goods sold</div>
+                  <div className="flex justify-between py-1.5 border-b border-gray-800/50">
+                    <span className="text-sm text-gray-300">Beginning inventory</span>
+                    <span className="text-sm font-mono text-gray-500 italic">Not yet entered</span>
+                  </div>
+                  <div className="flex justify-between py-1.5 border-b border-gray-800/50">
+                    <span className="text-sm text-gray-300">Purchases (from bank transactions + expenses)</span>
+                    <span className="text-sm font-mono text-gray-500 italic">Not yet entered</span>
+                  </div>
+                  <div className="flex justify-between py-1.5 border-b border-gray-800/50">
+                    <span className="text-sm text-gray-300">Ending inventory</span>
+                    <span className="text-sm font-mono text-gray-500 italic">Not yet entered</span>
+                  </div>
+                  <div className="flex justify-between pt-3 mt-2 border-t-2 border-amber-800">
+                    <span className="text-sm font-bold text-amber-400">COST OF GOODS SOLD</span>
+                    <span className="text-base font-bold font-mono text-amber-400">{fmt(0)}</span>
+                  </div>
+                  <p className="text-xs text-gray-600 mt-2">Upload credit card statements in Banking tab and tag sourcing purchases as COGS, or add manually in Expenses tab.</p>
+                </div>
+
+                {/* GROSS PROFIT */}
+                <div className="bg-indigo-500/5 border border-indigo-500/20 rounded-xl p-4">
+                  <div className="flex justify-between items-center">
+                    <span className="text-sm font-bold text-indigo-400">GROSS PROFIT (Revenue - COGS)</span>
+                    <span className="text-lg font-bold font-mono text-indigo-400">{fmt(Number(pnlData.gross_revenue))}</span>
+                  </div>
+                </div>
+
+                {/* AMAZON SELLING FEES */}
+                <div className="bg-[#111827] border border-gray-800 rounded-xl p-5">
+                  <div className="text-xs font-bold text-red-400 uppercase tracking-wider mb-4">Amazon selling fees</div>
+                  {[
+                    { label: "Referral fees", value: Number(pnlData.referral_fees) },
+                    { label: "FBA fulfillment fees", value: Number(pnlData.fba_fulfillment_fees) },
+                    { label: "FBA inventory & inbound fees", value: Number(pnlData.fba_inventory_fees) },
+                    { label: "Shipping label purchases", value: Number(pnlData.shipping_label_costs) },
+                    { label: "Service fees", value: Number(pnlData.service_fees) },
+                    { label: "Promotional costs", value: Number(pnlData.promotional_costs) },
+                    { label: "Other selling fees", value: Number(pnlData.other_selling_fees) },
+                  ].map(row => (
+                    <div key={row.label} className="flex justify-between py-1.5 border-b border-gray-800/50">
+                      <span className="text-sm text-gray-300">{row.label}</span>
+                      <span className="text-sm font-mono text-red-400">-{fmt(row.value)}</span>
+                    </div>
+                  ))}
+                  <div className="flex justify-between pt-3 mt-2 border-t-2 border-red-800">
+                    <span className="text-sm font-bold text-red-400">TOTAL SELLING FEES</span>
+                    <span className="text-base font-bold font-mono text-red-400">-{fmt(Number(pnlData.total_selling_fees))}</span>
+                  </div>
+                </div>
+
+                {/* OPERATING EXPENSES */}
+                <div className="bg-[#111827] border border-gray-800 rounded-xl p-5">
+                  <div className="text-xs font-bold text-orange-400 uppercase tracking-wider mb-4">Operating expenses (non-Amazon)</div>
+                  {totalExpenses > 0 ? (
+                    <>
+                      {expenses.slice(0, 10).map((e: any, i: number) => (
+                        <div key={i} className="flex justify-between py-1.5 border-b border-gray-800/50">
+                          <span className="text-sm text-gray-300">{e.expense_categories?.name || "Expense"}</span>
+                          <span className="text-sm font-mono text-red-400">-{fmt(Number(e.amount))}</span>
+                        </div>
+                      ))}
+                      <div className="flex justify-between pt-3 mt-2 border-t-2 border-orange-800">
+                        <span className="text-sm font-bold text-orange-400">TOTAL OPERATING EXPENSES</span>
+                        <span className="text-base font-bold font-mono text-orange-400">-{fmt(totalExpenses)}</span>
+                      </div>
+                    </>
+                  ) : (
+                    <p className="text-sm text-gray-500 italic">No operating expenses entered yet. Add expenses in the Expenses tab or upload bank statements in the Banking tab.</p>
+                  )}
+                </div>
+
+                {/* NET PROFIT */}
+                <div className={`rounded-xl p-5 border-2 ${Number(pnlData.net_amazon_profit) - totalExpenses >= 0 ? "bg-emerald-500/5 border-emerald-500/30" : "bg-red-500/5 border-red-500/30"}`}>
+                  <div className="flex justify-between items-center mb-3">
+                    <span className="text-sm font-bold text-white uppercase tracking-wider">NET PROFIT (before COGS)</span>
+                    <span className={`text-2xl font-bold font-mono ${Number(pnlData.net_amazon_profit) - totalExpenses >= 0 ? "text-emerald-400" : "text-red-400"}`}>
+                      {fmt(Number(pnlData.net_amazon_profit) - totalExpenses)}
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-3 gap-4 text-center text-xs text-gray-500">
+                    <div>
+                      <div>Revenue</div>
+                      <div className="text-sm font-mono text-emerald-400 mt-1">{fmt(Number(pnlData.gross_revenue))}</div>
+                    </div>
+                    <div>
+                      <div>Amazon fees</div>
+                      <div className="text-sm font-mono text-red-400 mt-1">-{fmt(Number(pnlData.total_selling_fees))}</div>
+                    </div>
+                    <div>
+                      <div>Expenses</div>
+                      <div className="text-sm font-mono text-red-400 mt-1">-{fmt(totalExpenses)}</div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* TAX MEMO */}
+                <div className="bg-[#111827] border border-gray-800 rounded-xl p-5">
+                  <div className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-4">Tax memo (informational — not included in P&L)</div>
+                  <div className="flex justify-between py-1.5 border-b border-gray-800/50">
+                    <span className="text-sm text-gray-500">Sales tax collected by Amazon</span>
+                    <span className="text-sm font-mono text-gray-500">{fmt(Number(pnlData.tax_collected))}</span>
+                  </div>
+                  <div className="flex justify-between py-1.5 border-b border-gray-800/50">
+                    <span className="text-sm text-gray-500">Marketplace tax withheld & remitted</span>
+                    <span className="text-sm font-mono text-gray-500">-{fmt(Number(pnlData.marketplace_tax_withheld))}</span>
+                  </div>
+                  <div className="flex justify-between py-1.5 border-b border-gray-800/50">
+                    <span className="text-sm text-gray-500">Bank transfers</span>
+                    <span className="text-sm font-mono text-gray-500">-{fmt(Number(pnlData.bank_transfers))}</span>
+                  </div>
+                  <div className="flex justify-between py-1.5">
+                    <span className="text-sm text-gray-500">Orders / Refunds / Unique SKUs</span>
+                    <span className="text-sm font-mono text-gray-500">{pnlData.total_orders} / {pnlData.total_refund_orders} / {pnlData.unique_skus}</span>
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <div className="text-center py-16 text-gray-500">Upload a settlement report to generate your P&L statement.</div>
             )}
           </div>
         )}
