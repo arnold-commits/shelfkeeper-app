@@ -12,7 +12,7 @@ type ParseResult = {
   rowCount: number;
 };
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from "recharts";
-import { Upload, FileText, TrendingUp, DollarSign, AlertTriangle, Package, MessageSquare, Plus, Download, LogOut, ChevronDown } from "lucide-react";
+import { Upload, FileText, TrendingUp, DollarSign, AlertTriangle, Package, MessageSquare, Plus, Download, LogOut, ChevronDown, BarChart3 } from "lucide-react";
 import Link from "next/link";
 
 // ── FORMATTING HELPERS ─────────────────────────────────
@@ -58,6 +58,9 @@ export default function Dashboard() {
   // New expense form
   const [newExp, setNewExp] = useState({ date: new Date().toISOString().slice(0, 10), category: EXPENSE_CATS[0], amount: "", vendor: "", description: "" });
 
+  // Balance sheet
+  const [balanceSheet, setBalanceSheet] = useState<any>(null);
+
   const supabase = createClient();
 
   // Check auth
@@ -72,6 +75,7 @@ export default function Dashboard() {
     if (!user) return;
     loadData();
     loadExpenses();
+    loadBalanceSheet();
   }, [user]);
 
   const loadData = async () => {
@@ -119,6 +123,11 @@ export default function Dashboard() {
       .order("date", { ascending: false })
       .limit(100);
     if (data) setExpenses(data);
+  };
+
+  const loadBalanceSheet = async () => {
+    const { data } = await supabase.from("v_balance_sheet").select("*").limit(1);
+    if (data && data.length > 0) setBalanceSheet(data[0]);
   };
 
   // File upload handler
@@ -254,6 +263,7 @@ export default function Dashboard() {
     { id: "dashboard", label: "Dashboard", icon: TrendingUp },
     { id: "products", label: "Products", icon: Package },
     { id: "fees", label: "Fees", icon: DollarSign },
+    { id: "balance", label: "Balance Sheet", icon: BarChart3 },
     { id: "expenses", label: "Expenses", icon: FileText },
     { id: "ask", label: "Ask AI", icon: MessageSquare },
   ];
@@ -449,6 +459,112 @@ export default function Dashboard() {
               </>
             ) : (
               <div className="text-center py-16 text-gray-500">Upload a settlement report to see fee analysis.</div>
+            )}
+          </div>
+        )}
+
+        {/* ── BALANCE SHEET TAB ──────────────────────── */}
+        {tab === "balance" && (
+          <div>
+            <h2 className="text-lg font-bold mb-1">Balance Sheet</h2>
+            <p className="text-sm text-gray-500 mb-6">As of {new Date().toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" })}</p>
+
+            {balanceSheet ? (
+              <div className="space-y-6">
+                {/* ASSETS */}
+                <div className="bg-[#111827] border border-gray-800 rounded-xl p-5">
+                  <div className="text-sm font-bold text-emerald-400 uppercase tracking-wider mb-4">Assets</div>
+
+                  <div className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2 mt-2">Current assets</div>
+                  <div className="space-y-2 ml-2">
+                    {[
+                      { label: "Cash — Amazon deposits", value: Number(balanceSheet.cash_amazon_deposits) },
+                      { label: "Cash — Bank balance", value: Number(balanceSheet.cash_bank_balance) },
+                      { label: "Inventory on hand", value: Number(balanceSheet.inventory_on_hand) },
+                    ].map((item) => (
+                      <div key={item.label} className="flex justify-between items-center py-1.5 border-b border-gray-800/50">
+                        <span className="text-sm text-gray-300">{item.label}</span>
+                        <span className="text-sm font-mono text-gray-200">{fmt(item.value)}</span>
+                      </div>
+                    ))}
+                  </div>
+
+                  <div className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2 mt-5">Fixed assets</div>
+                  <div className="space-y-2 ml-2">
+                    {[
+                      { label: "Property & equipment (gross)", value: Number(balanceSheet.fixed_assets_gross) },
+                      { label: "Less: accumulated depreciation", value: -Number(balanceSheet.accumulated_depreciation) },
+                      { label: "Property & equipment (net)", value: Number(balanceSheet.fixed_assets_net) },
+                    ].map((item) => (
+                      <div key={item.label} className="flex justify-between items-center py-1.5 border-b border-gray-800/50">
+                        <span className={`text-sm ${item.label.includes("Less:") ? "text-gray-500 italic" : "text-gray-300"}`}>{item.label}</span>
+                        <span className={`text-sm font-mono ${item.value < 0 ? "text-red-400" : "text-gray-200"}`}>{fmt(item.value)}</span>
+                      </div>
+                    ))}
+                  </div>
+
+                  <div className="flex justify-between items-center mt-4 pt-3 border-t-2 border-emerald-800">
+                    <span className="text-sm font-bold text-emerald-400">TOTAL ASSETS</span>
+                    <span className="text-lg font-bold font-mono text-emerald-400">{fmt(Number(balanceSheet.total_assets))}</span>
+                  </div>
+                </div>
+
+                {/* LIABILITIES */}
+                <div className="bg-[#111827] border border-gray-800 rounded-xl p-5">
+                  <div className="text-sm font-bold text-red-400 uppercase tracking-wider mb-4">Liabilities</div>
+                  <div className="space-y-2 ml-2">
+                    <div className="flex justify-between items-center py-1.5 border-b border-gray-800/50">
+                      <span className="text-sm text-gray-300">Accounts payable / expenses</span>
+                      <span className="text-sm font-mono text-gray-200">{fmt(Number(balanceSheet.total_liabilities))}</span>
+                    </div>
+                  </div>
+                  <div className="flex justify-between items-center mt-4 pt-3 border-t-2 border-red-800">
+                    <span className="text-sm font-bold text-red-400">TOTAL LIABILITIES</span>
+                    <span className="text-lg font-bold font-mono text-red-400">{fmt(Number(balanceSheet.total_liabilities))}</span>
+                  </div>
+                </div>
+
+                {/* EQUITY */}
+                <div className="bg-[#111827] border border-gray-800 rounded-xl p-5">
+                  <div className="text-sm font-bold text-indigo-400 uppercase tracking-wider mb-4">Owner&apos;s Equity</div>
+                  <div className="space-y-2 ml-2">
+                    {[
+                      { label: "Retained earnings — Amazon", value: Number(balanceSheet.retained_earnings_amazon) },
+                      { label: "Retained earnings — Other income", value: Number(balanceSheet.retained_earnings_other) },
+                      { label: "Less: total expenses", value: -Number(balanceSheet.total_liabilities) },
+                    ].map((item) => (
+                      <div key={item.label} className="flex justify-between items-center py-1.5 border-b border-gray-800/50">
+                        <span className={`text-sm ${item.label.includes("Less:") ? "text-gray-500 italic" : "text-gray-300"}`}>{item.label}</span>
+                        <span className={`text-sm font-mono ${item.value < 0 ? "text-red-400" : "text-gray-200"}`}>{fmt(item.value)}</span>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="flex justify-between items-center mt-4 pt-3 border-t-2 border-indigo-800">
+                    <span className="text-sm font-bold text-indigo-400">TOTAL OWNER&apos;S EQUITY</span>
+                    <span className="text-lg font-bold font-mono text-indigo-400">{fmt(Number(balanceSheet.owners_equity))}</span>
+                  </div>
+                </div>
+
+                {/* ACCOUNTING EQUATION CHECK */}
+                <div className="bg-indigo-500/5 border border-indigo-500/20 rounded-xl p-4">
+                  <div className="text-xs font-bold text-indigo-400 uppercase tracking-wider mb-3">Accounting equation check</div>
+                  <div className="grid grid-cols-3 gap-4 text-center">
+                    <div>
+                      <div className="text-xs text-gray-500 mb-1">Assets</div>
+                      <div className="text-base font-bold font-mono text-emerald-400">{fmt(Number(balanceSheet.total_assets))}</div>
+                    </div>
+                    <div className="flex items-center justify-center text-gray-500 text-lg">=</div>
+                    <div>
+                      <div className="text-xs text-gray-500 mb-1">Liabilities + Equity</div>
+                      <div className="text-base font-bold font-mono text-indigo-400">
+                        {fmt(Number(balanceSheet.total_liabilities) + Number(balanceSheet.owners_equity))}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <div className="text-center py-16 text-gray-500">Upload a settlement report and add expenses to generate your balance sheet.</div>
             )}
           </div>
         )}
