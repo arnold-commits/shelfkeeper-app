@@ -90,6 +90,10 @@ export default function Dashboard() {
   // Trial Balance
   const [trialBalance, setTrialBalance] = useState<any[]>([]);
 
+  // Date Range Filter
+  const [dateFrom, setDateFrom] = useState("2025-01-01");
+  const [dateTo, setDateTo] = useState("2025-12-31");
+
   // Inventory snapshots
   const [beginInv, setBeginInv] = useState(0);
   const [endInv, setEndInv] = useState(0);
@@ -185,9 +189,16 @@ export default function Dashboard() {
     if (data) setReconData(data);
   };
 
-  const loadPnl = async () => {
-    const { data } = await supabase.from("v_profit_loss_statement").select("*").limit(1);
+  const loadPnl = async (from?: string, to?: string) => {
+    const startDate = from || dateFrom;
+    const endDate = to || dateTo;
+    const { data } = await supabase.rpc("get_pnl_by_daterange", { p_user_id: user.id, p_from: startDate, p_to: endDate });
     if (data && data.length > 0) setPnlData(data[0]);
+    else {
+      // Fallback to the view for backward compatibility
+      const { data: viewData } = await supabase.from("v_profit_loss_statement").select("*").limit(1);
+      if (viewData && viewData.length > 0) setPnlData(viewData[0]);
+    }
   };
 
   const loadK1099 = async () => {
@@ -617,10 +628,33 @@ export default function Dashboard() {
         {/* ── P&L STATEMENT TAB ──────────────────────── */}
         {tab === "pnl" && (
           <div>
+            {/* Date Range Picker */}
+            <div className="bg-[#111827] border border-gray-800 rounded-xl p-4 mb-4">
+              <div className="flex items-center gap-3 flex-wrap">
+                <span className="text-xs text-gray-500 font-medium">DATE RANGE:</span>
+                <input type="date" className="bg-gray-900 border border-gray-700 rounded-lg px-3 py-1.5 text-sm" value={dateFrom} onChange={e => setDateFrom(e.target.value)} />
+                <span className="text-gray-600">to</span>
+                <input type="date" className="bg-gray-900 border border-gray-700 rounded-lg px-3 py-1.5 text-sm" value={dateTo} onChange={e => setDateTo(e.target.value)} />
+                <button onClick={() => loadPnl()} className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 rounded-lg text-xs font-medium transition">Apply</button>
+                <div className="flex gap-1 ml-2">
+                  {[
+                    { label: "Full Year", from: "2025-01-01", to: "2025-12-31" },
+                    { label: "Q1", from: "2025-01-01", to: "2025-03-31" },
+                    { label: "Q2", from: "2025-04-01", to: "2025-06-30" },
+                    { label: "Q3", from: "2025-07-01", to: "2025-09-30" },
+                    { label: "Q4", from: "2025-10-01", to: "2025-12-31" },
+                  ].map(p => (
+                    <button key={p.label} onClick={() => { setDateFrom(p.from); setDateTo(p.to); loadPnl(p.from, p.to); }}
+                      className={`px-2 py-1 rounded text-[10px] font-medium transition ${dateFrom === p.from && dateTo === p.to ? "bg-indigo-600 text-white" : "bg-gray-800 text-gray-400 hover:bg-gray-700"}`}>{p.label}</button>
+                  ))}
+                </div>
+              </div>
+            </div>
+
             <div className="flex justify-between items-start mb-6">
               <div>
                 <h2 className="text-lg font-bold">Profit & Loss Statement</h2>
-                <p className="text-sm text-gray-500">Tax Year {pnlData?.tax_year || 2025} — Schedule C Format</p>
+                <p className="text-sm text-gray-500">{dateFrom} to {dateTo} — Schedule C Format</p>
               </div>
               {pnlData && (
                 <div className="text-right">
