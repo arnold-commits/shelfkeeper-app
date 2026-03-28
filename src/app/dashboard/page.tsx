@@ -94,6 +94,10 @@ export default function Dashboard() {
   const [dateFrom, setDateFrom] = useState("2025-01-01");
   const [dateTo, setDateTo] = useState("2025-12-31");
 
+  // Inventory edit
+  const [showInvEdit, setShowInvEdit] = useState(false);
+  const [invForm, setInvForm] = useState({ beginDate: "2025-01-01", beginValue: "79104", beginItems: "15821", endDate: "2025-12-31", endValue: "70000", endItems: "14000" });
+
   // Inventory snapshots
   const [beginInv, setBeginInv] = useState(0);
   const [endInv, setEndInv] = useState(0);
@@ -223,8 +227,14 @@ export default function Dashboard() {
     if (data && data.length > 0) {
       const begin = data.find((d: any) => d.snapshot_date?.startsWith('2025-01-01'));
       const end = data.find((d: any) => d.snapshot_date?.startsWith('2025-12-31'));
-      if (begin) setBeginInv(Number(begin.total_value));
-      if (end) setEndInv(Number(end.total_value));
+      if (begin) {
+        setBeginInv(Number(begin.total_value));
+        setInvForm(prev => ({ ...prev, beginValue: String(begin.total_value), beginItems: String(begin.item_count || "15821"), beginDate: begin.snapshot_date }));
+      }
+      if (end) {
+        setEndInv(Number(end.total_value));
+        setInvForm(prev => ({ ...prev, endValue: String(end.total_value), endItems: String(end.item_count || "14000"), endDate: end.snapshot_date }));
+      }
     }
   };
 
@@ -299,6 +309,33 @@ export default function Dashboard() {
   // Add JE line
   const addJELine = () => {
     setJeForm(prev => ({ ...prev, lines: [...prev.lines, { account_id: "", debit: "", credit: "", memo: "" }] }));
+  };
+
+  // Save inventory snapshots
+  const saveInventory = async () => {
+    if (!user) return;
+    // Upsert beginning inventory
+    await supabase.from("inventory_snapshots").upsert({
+      user_id: user.id, snapshot_date: invForm.beginDate,
+      total_value: parseFloat(invForm.beginValue) || 0,
+      item_count: parseInt(invForm.beginItems) || null,
+      notes: `Beginning inventory ${invForm.beginDate} — ${invForm.beginItems} items × $${(parseFloat(invForm.beginValue) / (parseInt(invForm.beginItems) || 1)).toFixed(2)} avg`,
+      snapshot_type: "manual",
+    }, { onConflict: "user_id,snapshot_date" });
+    // Upsert ending inventory
+    await supabase.from("inventory_snapshots").upsert({
+      user_id: user.id, snapshot_date: invForm.endDate,
+      total_value: parseFloat(invForm.endValue) || 0,
+      item_count: parseInt(invForm.endItems) || null,
+      notes: `Ending inventory ${invForm.endDate} — ${invForm.endItems} items × $${(parseFloat(invForm.endValue) / (parseInt(invForm.endItems) || 1)).toFixed(2)} avg`,
+      snapshot_type: "manual",
+    }, { onConflict: "user_id,snapshot_date" });
+    // Update COA
+    await supabase.from("chart_of_accounts").update({ beginning_balance: parseFloat(invForm.endValue) || 0 }).eq("account_number", "1200").eq("user_id", user.id);
+    setShowInvEdit(false);
+    await loadInventory();
+    await loadPnl();
+    alert("Inventory saved!");
   };
 
   // Bank CSV upload handler
@@ -762,7 +799,50 @@ export default function Dashboard() {
                     <span className="text-sm font-bold text-amber-400">Line 4 · COGS (Line 41 minus Line 42)</span>
                     <span className="text-base font-bold font-mono text-amber-400">{fmt(actualCogs)}</span>
                   </div>
-                  <p className="text-xs text-gray-600 mt-3">Upload credit card statements in Banking tab and tag sourcing purchases. Or add manually in Expenses tab under Cost of Goods Sold.</p>
+                  <div className="flex justify-between items-center mt-3">
+                    <p className="text-xs text-gray-600">Upload credit card statements in Banking tab and tag sourcing purchases. Or add manually in Expenses tab under Cost of Goods Sold.</p>
+                    <button onClick={() => setShowInvEdit(!showInvEdit)} className="text-xs text-amber-400 hover:text-amber-300 whitespace-nowrap ml-3">
+                      {showInvEdit ? "Cancel" : "Edit Inventory"}
+                    </button>
+                  </div>
+
+                  {showInvEdit && (
+                    <div className="mt-4 bg-gray-900/50 rounded-lg p-4 border border-gray-700">
+                      <div className="text-xs font-bold text-amber-400 uppercase mb-3">Edit Inventory Values</div>
+                      <div className="grid grid-cols-3 gap-3 mb-3">
+                        <div>
+                          <label className="text-[10px] text-gray-500">Beginning Date</label>
+                          <input type="date" className="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs mt-1" value={invForm.beginDate} onChange={e => setInvForm(p => ({ ...p, beginDate: e.target.value }))} />
+                        </div>
+                        <div>
+                          <label className="text-[10px] text-gray-500">Beginning Value ($)</label>
+                          <input type="number" className="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs mt-1" value={invForm.beginValue} onChange={e => setInvForm(p => ({ ...p, beginValue: e.target.value }))} />
+                        </div>
+                        <div>
+                          <label className="text-[10px] text-gray-500">Item Count</label>
+                          <input type="number" className="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs mt-1" value={invForm.beginItems} onChange={e => setInvForm(p => ({ ...p, beginItems: e.target.value }))} />
+                        </div>
+                      </div>
+                      <div className="grid grid-cols-3 gap-3 mb-3">
+                        <div>
+                          <label className="text-[10px] text-gray-500">Ending Date</label>
+                          <input type="date" className="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs mt-1" value={invForm.endDate} onChange={e => setInvForm(p => ({ ...p, endDate: e.target.value }))} />
+                        </div>
+                        <div>
+                          <label className="text-[10px] text-gray-500">Ending Value ($)</label>
+                          <input type="number" className="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs mt-1" value={invForm.endValue} onChange={e => setInvForm(p => ({ ...p, endValue: e.target.value }))} />
+                        </div>
+                        <div>
+                          <label className="text-[10px] text-gray-500">Item Count</label>
+                          <input type="number" className="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs mt-1" value={invForm.endItems} onChange={e => setInvForm(p => ({ ...p, endItems: e.target.value }))} />
+                        </div>
+                      </div>
+                      <div className="flex justify-between items-center">
+                        <span className="text-xs text-gray-500">Avg cost/item: ${(parseFloat(invForm.endValue) / (parseInt(invForm.endItems) || 1)).toFixed(2)}</span>
+                        <button onClick={saveInventory} className="px-4 py-1.5 bg-amber-600 hover:bg-amber-500 rounded-lg text-xs font-medium transition">Save Inventory</button>
+                      </div>
+                    </div>
+                  )}
                 </div>
 
                 {/* ── GROSS PROFIT ── */}
