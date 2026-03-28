@@ -304,10 +304,11 @@ export default function Dashboard() {
       }));
 
       for (let i = 0; i < txRows.length; i += 500) {
-        await supabase.from("bank_transactions").insert(txRows.slice(i, i + 500));
+        const { error: batchErr } = await supabase.from("bank_transactions").upsert(txRows.slice(i, i + 500), { onConflict: "user_id,date,description,amount,import_id", ignoreDuplicates: true });
+        if (batchErr && !batchErr.message?.includes("duplicate")) console.warn("Bank batch error:", batchErr.message);
         setBankMsg(`Saved ${Math.min(i + 500, txRows.length)} of ${txRows.length}...`);
       }
-      setBankMsg(`Done! ${result.rowCount} transactions imported.`);
+      setBankMsg(`Done! ${result.rowCount} transactions imported (duplicates skipped).`);
       await loadBankTransactions();
     } catch (err: any) { setBankMsg(`Error: ${err.message}`); }
     finally { setBankUploading(false); }
@@ -378,7 +379,14 @@ export default function Dashboard() {
           .select()
           .single();
 
-        if (reportErr) { setUploadMsg(`File ${f + 1} DB error: ${reportErr.message}`); continue; }
+        if (reportErr) { 
+          if (reportErr.message?.includes("duplicate") || reportErr.message?.includes("unique")) {
+            setUploadMsg(`File ${f + 1}/${totalFiles}: "${file.name}" already uploaded. Skipping...`);
+          } else {
+            setUploadMsg(`File ${f + 1} DB error: ${reportErr.message}`);
+          }
+          continue; 
+        }
 
         // Batch insert transactions
         const txRows = result.transactions.map((tx: any) => ({
@@ -395,7 +403,8 @@ export default function Dashboard() {
         }));
 
         for (let i = 0; i < txRows.length; i += 500) {
-          await supabase.from("settlement_transactions").insert(txRows.slice(i, i + 500));
+          const { error: batchErr } = await supabase.from("settlement_transactions").upsert(txRows.slice(i, i + 500), { onConflict: "user_id,posted_date,order_id,amount_type,amount_description,amount", ignoreDuplicates: true });
+          if (batchErr && !batchErr.message?.includes("duplicate")) console.warn("Batch error:", batchErr.message);
         }
 
         successCount++;
