@@ -170,9 +170,15 @@ export default function Dashboard() {
     if (data) setExpenses(data);
   };
 
-  const loadBalanceSheet = async () => {
-    const { data } = await supabase.from("v_balance_sheet").select("*").limit(1);
+  const loadBalanceSheet = async (from?: string, to?: string) => {
+    const startDate = from || dateFrom;
+    const endDate = to || dateTo;
+    const { data } = await supabase.rpc("get_balance_sheet_by_daterange", { p_user_id: user.id, p_from: startDate, p_to: endDate });
     if (data && data.length > 0) setBalanceSheet(data[0]);
+    else {
+      const { data: viewData } = await supabase.from("v_balance_sheet").select("*").limit(1);
+      if (viewData && viewData.length > 0) setBalanceSheet(viewData[0]);
+    }
   };
 
   const loadBankTransactions = async () => {
@@ -184,9 +190,15 @@ export default function Dashboard() {
     if (data) setBankTxns(data);
   };
 
-  const loadReconciliation = async () => {
-    const { data } = await supabase.from("v_accrual_vs_cash").select("*").order("month", { ascending: false }).limit(12);
+  const loadReconciliation = async (from?: string, to?: string) => {
+    const startDate = from || dateFrom;
+    const endDate = to || dateTo;
+    const { data } = await supabase.rpc("get_reconciliation_by_daterange", { p_user_id: user.id, p_from: startDate, p_to: endDate });
     if (data) setReconData(data);
+    else {
+      const { data: viewData } = await supabase.from("v_accrual_vs_cash").select("*").order("month", { ascending: false }).limit(12);
+      if (viewData) setReconData(viewData);
+    }
   };
 
   const loadPnl = async (from?: string, to?: string) => {
@@ -1113,8 +1125,31 @@ export default function Dashboard() {
         {/* ── RECONCILIATION TAB ─────────────────────── */}
         {tab === "reconcile" && (
           <div>
+            {/* Date Range Picker */}
+            <div className="bg-[#111827] border border-gray-800 rounded-xl p-4 mb-4">
+              <div className="flex items-center gap-3 flex-wrap">
+                <span className="text-xs text-gray-500 font-medium">DATE RANGE:</span>
+                <input type="date" className="bg-gray-900 border border-gray-700 rounded-lg px-3 py-1.5 text-sm" value={dateFrom} onChange={e => setDateFrom(e.target.value)} />
+                <span className="text-gray-600">to</span>
+                <input type="date" className="bg-gray-900 border border-gray-700 rounded-lg px-3 py-1.5 text-sm" value={dateTo} onChange={e => setDateTo(e.target.value)} />
+                <button onClick={() => loadReconciliation()} className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 rounded-lg text-xs font-medium transition">Apply</button>
+                <div className="flex gap-1 ml-2">
+                  {[
+                    { label: "Full Year", from: "2025-01-01", to: "2025-12-31" },
+                    { label: "Q1", from: "2025-01-01", to: "2025-03-31" },
+                    { label: "Q2", from: "2025-04-01", to: "2025-06-30" },
+                    { label: "Q3", from: "2025-07-01", to: "2025-09-30" },
+                    { label: "Q4", from: "2025-10-01", to: "2025-12-31" },
+                  ].map(p => (
+                    <button key={p.label} onClick={() => { setDateFrom(p.from); setDateTo(p.to); loadReconciliation(p.from, p.to); }}
+                      className={`px-2 py-1 rounded text-[10px] font-medium transition ${dateFrom === p.from && dateTo === p.to ? "bg-indigo-600 text-white" : "bg-gray-800 text-gray-400 hover:bg-gray-700"}`}>{p.label}</button>
+                  ))}
+                </div>
+              </div>
+            </div>
+
             <h2 className="text-lg font-bold mb-1">Bank Reconciliation</h2>
-            <p className="text-sm text-gray-500 mb-6">Accrual vs cash basis — matches Amazon settlements to bank deposits</p>
+            <p className="text-sm text-gray-500 mb-6">{dateFrom} to {dateTo} — Accrual vs cash basis</p>
 
             {reconData && reconData.length > 0 ? (
               <div className="space-y-3">
@@ -1185,8 +1220,31 @@ export default function Dashboard() {
         {/* ── BALANCE SHEET TAB ──────────────────────── */}
         {tab === "balance" && (
           <div>
+            {/* Date Range Picker */}
+            <div className="bg-[#111827] border border-gray-800 rounded-xl p-4 mb-4">
+              <div className="flex items-center gap-3 flex-wrap">
+                <span className="text-xs text-gray-500 font-medium">AS OF DATE:</span>
+                <input type="date" className="bg-gray-900 border border-gray-700 rounded-lg px-3 py-1.5 text-sm" value={dateFrom} onChange={e => setDateFrom(e.target.value)} />
+                <span className="text-gray-600">to</span>
+                <input type="date" className="bg-gray-900 border border-gray-700 rounded-lg px-3 py-1.5 text-sm" value={dateTo} onChange={e => setDateTo(e.target.value)} />
+                <button onClick={() => loadBalanceSheet()} className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 rounded-lg text-xs font-medium transition">Apply</button>
+                <div className="flex gap-1 ml-2">
+                  {[
+                    { label: "Full Year", from: "2025-01-01", to: "2025-12-31" },
+                    { label: "Q1", from: "2025-01-01", to: "2025-03-31" },
+                    { label: "Q2", from: "2025-04-01", to: "2025-06-30" },
+                    { label: "Q3", from: "2025-07-01", to: "2025-09-30" },
+                    { label: "Q4", from: "2025-10-01", to: "2025-12-31" },
+                  ].map(p => (
+                    <button key={p.label} onClick={() => { setDateFrom(p.from); setDateTo(p.to); loadBalanceSheet(p.from, p.to); }}
+                      className={`px-2 py-1 rounded text-[10px] font-medium transition ${dateFrom === p.from && dateTo === p.to ? "bg-indigo-600 text-white" : "bg-gray-800 text-gray-400 hover:bg-gray-700"}`}>{p.label}</button>
+                  ))}
+                </div>
+              </div>
+            </div>
+
             <h2 className="text-lg font-bold mb-1">Balance Sheet</h2>
-            <p className="text-sm text-gray-500 mb-6">As of {new Date().toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" })}</p>
+            <p className="text-sm text-gray-500 mb-6">Period: {dateFrom} to {dateTo}</p>
 
             {balanceSheet ? (
               <div className="space-y-6">
