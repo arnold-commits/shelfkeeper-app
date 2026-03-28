@@ -1439,18 +1439,52 @@ export default function Dashboard() {
                     {/* Date */}
                     <div className="text-xs font-mono text-gray-500 w-16 shrink-0">{tx.date?.slice(5)}</div>
 
-                    {/* Description + AI suggestion */}
+                    {/* Description + account source */}
                     <div className="flex-1 min-w-0">
                       <div className="text-sm font-medium truncate">{tx.description}</div>
                       <div className="text-xs text-gray-500">
-                        {tx.ai_category_suggestion ? (
-                          <span className="text-indigo-400">{tx.ai_category_suggestion}</span>
-                        ) : (
-                          <span className="text-gray-600 italic">No category match</span>
-                        )}
-                        {tx.bank_imports?.account_name && <span className="ml-2 text-gray-600">· {tx.bank_imports.account_name}</span>}
+                        {tx.bank_imports?.account_name && <span className="text-gray-600">{tx.bank_imports.account_name}</span>}
                       </div>
                     </div>
+
+                    {/* Category selector */}
+                    <select className="bg-gray-900 border border-gray-700 rounded px-2 py-1 text-[10px] w-36 shrink-0"
+                      value={tx.category_suggestion || tx.ai_category_suggestion || ""}
+                      onChange={async (e) => {
+                        const cat = e.target.value;
+                        await supabase.from("bank_transactions").update({ category_suggestion: cat, is_business: cat ? true : tx.is_business }).eq("id", tx.id);
+                        setBankTxns(prev => prev.map(t => t.id === tx.id ? { ...t, category_suggestion: cat, is_business: cat ? true : t.is_business } : t));
+                        // If COGS, auto-create expense entry
+                        if (cat === "Cost of Goods Sold" && Number(tx.amount) < 0) {
+                          const { data: cogsCat } = await supabase.from("expense_categories").select("id").eq("name", "Cost of Goods Sold").limit(1);
+                          if (cogsCat?.[0]) {
+                            await supabase.from("expense_transactions").upsert({
+                              user_id: user.id, category_id: cogsCat[0].id, date: tx.date,
+                              amount: Math.abs(Number(tx.amount)), vendor: (tx.description || "").slice(0, 100),
+                              description: `CC purchase — ${(tx.description || "").slice(0, 60)}`,
+                            }, { onConflict: "user_id,date,amount,vendor", ignoreDuplicates: true });
+                          }
+                        }
+                      }}>
+                      <option value="">— Category —</option>
+                      <option value="Cost of Goods Sold">💰 Cost of Goods Sold</option>
+                      <option value="Shipping & Postage">📦 Shipping & Postage</option>
+                      <option value="Packaging & Supplies">🏷️ Packaging & Supplies</option>
+                      <option value="Office Supplies">🖊️ Office Supplies</option>
+                      <option value="Software & Subscriptions">💻 Software & Subscriptions</option>
+                      <option value="Car & Truck Expenses">🚗 Car & Truck Expenses</option>
+                      <option value="Meals (50%)">🍔 Meals (50%)</option>
+                      <option value="Insurance">🛡️ Insurance</option>
+                      <option value="Education & Training">📚 Education & Training</option>
+                      <option value="Professional Services">⚖️ Professional Services</option>
+                      <option value="Advertising">📣 Advertising</option>
+                      <option value="Rent/Lease (Other)">🏢 Rent/Lease</option>
+                      <option value="Utilities">⚡ Utilities</option>
+                      <option value="Home Office">🏠 Home Office</option>
+                      <option value="Product Sales — Amazon">🟢 Amazon Deposit</option>
+                      <option value="Transfer">↔️ Transfer (not expense)</option>
+                      <option value="Personal">🚫 Personal (not deductible)</option>
+                    </select>
 
                     {/* Amount */}
                     <div className={`text-sm font-mono font-semibold w-24 text-right shrink-0 ${Number(tx.amount) >= 0 ? "text-emerald-400" : "text-red-400"}`}>
