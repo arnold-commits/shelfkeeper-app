@@ -77,6 +77,23 @@ export default function Dashboard() {
   // 1099-K Reconciliation
   const [k1099Recon, setK1099Recon] = useState<any[]>([]);
 
+  // Chart of Accounts
+  const [coaAccounts, setCoaAccounts] = useState<any[]>([]);
+  const [coaEditId, setCoaEditId] = useState<string | null>(null);
+  const [coaForm, setCoaForm] = useState({ account_number: "", account_name: "", account_type: "asset", description: "", beginning_balance: "0" });
+
+  // Journal Entries
+  const [journalEntries, setJournalEntries] = useState<any[]>([]);
+  const [showJEForm, setShowJEForm] = useState(false);
+  const [jeForm, setJeForm] = useState({ date: new Date().toISOString().slice(0, 10), memo: "", is_opening_balance: false, lines: [{ account_id: "", debit: "", credit: "", memo: "" }, { account_id: "", debit: "", credit: "", memo: "" }] });
+
+  // Trial Balance
+  const [trialBalance, setTrialBalance] = useState<any[]>([]);
+
+  // Inventory snapshots
+  const [beginInv, setBeginInv] = useState(0);
+  const [endInv, setEndInv] = useState(0);
+
   const supabase = createClient();
 
   // Check auth
@@ -96,6 +113,10 @@ export default function Dashboard() {
     loadReconciliation();
     loadPnl();
     loadK1099();
+    loadInventory();
+    loadCOA();
+    loadJournalEntries();
+    loadTrialBalance();
   }, [user]);
 
   const loadData = async () => {
@@ -172,6 +193,89 @@ export default function Dashboard() {
   const loadK1099 = async () => {
     const { data } = await supabase.from("v_1099k_reconciliation").select("*").order("month_num");
     if (data) setK1099Recon(data);
+  };
+
+  const loadInventory = async () => {
+    const { data } = await supabase.from("inventory_snapshots").select("*").order("snapshot_date");
+    if (data && data.length > 0) {
+      const begin = data.find((d: any) => d.snapshot_date?.startsWith('2025-01-01'));
+      const end = data.find((d: any) => d.snapshot_date?.startsWith('2025-12-31'));
+      if (begin) setBeginInv(Number(begin.total_value));
+      if (end) setEndInv(Number(end.total_value));
+    }
+  };
+
+  const loadCOA = async () => {
+    const { data } = await supabase.from("chart_of_accounts").select("*").order("account_number");
+    if (data) setCoaAccounts(data);
+  };
+
+  const loadJournalEntries = async () => {
+    const { data } = await supabase
+      .from("journal_entries")
+      .select("*, journal_entry_lines(*, chart_of_accounts(account_number, account_name))")
+      .order("entry_date", { ascending: false })
+      .limit(100);
+    if (data) setJournalEntries(data);
+  };
+
+  const loadTrialBalance = async () => {
+    const { data } = await supabase.from("v_trial_balance").select("*");
+    if (data) setTrialBalance(data);
+  };
+
+  // Save COA account (add or update)
+  const saveCOAAccount = async () => {
+    if (!user || !coaForm.account_number || !coaForm.account_name) return;
+    if (coaEditId) {
+      await supabase.from("chart_of_accounts").update({
+        account_number: coaForm.account_number, account_name: coaForm.account_name,
+        account_type: coaForm.account_type, description: coaForm.description,
+        beginning_balance: parseFloat(coaForm.beginning_balance) || 0,
+      }).eq("id", coaEditId);
+      setCoaEditId(null);
+    } else {
+      await supabase.from("chart_of_accounts").insert({
+        user_id: user.id, account_number: coaForm.account_number, account_name: coaForm.account_name,
+        account_type: coaForm.account_type, description: coaForm.description,
+        beginning_balance: parseFloat(coaForm.beginning_balance) || 0,
+      });
+    }
+    setCoaForm({ account_number: "", account_name: "", account_type: "asset", description: "", beginning_balance: "0" });
+    await loadCOA();
+    await loadTrialBalance();
+  };
+
+  // Save journal entry
+  const saveJournalEntry = async () => {
+    if (!user) return;
+    const lines = jeForm.lines.filter(l => l.account_id && (parseFloat(l.debit) > 0 || parseFloat(l.credit) > 0));
+    if (lines.length < 2) return alert("Journal entry needs at least 2 lines.");
+    const totalDebits = lines.reduce((s, l) => s + (parseFloat(l.debit) || 0), 0);
+    const totalCredits = lines.reduce((s, l) => s + (parseFloat(l.credit) || 0), 0);
+    if (Math.abs(totalDebits - totalCredits) > 0.01) return alert(`Debits ($${totalDebits.toFixed(2)}) must equal Credits ($${totalCredits.toFixed(2)})`);
+
+    const { data: je, error } = await supabase.from("journal_entries").insert({
+      user_id: user.id, entry_date: jeForm.date, memo: jeForm.memo,
+      is_opening_balance: jeForm.is_opening_balance, source: "manual", status: "posted",
+    }).select().single();
+    if (error || !je) return alert("Error creating journal entry: " + error?.message);
+
+    const lineRows = lines.map((l, i) => ({
+      journal_entry_id: je.id, account_id: l.account_id,
+      debit: parseFloat(l.debit) || 0, credit: parseFloat(l.credit) || 0,
+      memo: l.memo, sort_order: i,
+    }));
+    await supabase.from("journal_entry_lines").insert(lineRows);
+    setShowJEForm(false);
+    setJeForm({ date: new Date().toISOString().slice(0, 10), memo: "", is_opening_balance: false, lines: [{ account_id: "", debit: "", credit: "", memo: "" }, { account_id: "", debit: "", credit: "", memo: "" }] });
+    await loadJournalEntries();
+    await loadTrialBalance();
+  };
+
+  // Add JE line
+  const addJELine = () => {
+    setJeForm(prev => ({ ...prev, lines: [...prev.lines, { account_id: "", debit: "", credit: "", memo: "" }] }));
   };
 
   // Bank CSV upload handler
@@ -358,6 +462,12 @@ export default function Dashboard() {
   };
 
   const totalExpenses = useMemo(() => expenses.reduce((s, e) => s + Number(e.amount), 0), [expenses]);
+  const cogsTotal = useMemo(() => expenses.filter((e: any) => e.expense_categories?.name === 'Cost of Goods Sold').reduce((s: number, e: any) => s + Number(e.amount), 0), [expenses]);
+  const cogsPurchases = cogsTotal; // Raw purchases amount
+  const actualCogs = beginInv + cogsPurchases - endInv; // Schedule C Part III formula
+  const operatingExpenses = useMemo(() => expenses.filter((e: any) => e.expense_categories?.name !== 'Cost of Goods Sold').reduce((s: number, e: any) => s + Number(e.amount), 0), [expenses]);
+  const cogsItems = useMemo(() => expenses.filter((e: any) => e.expense_categories?.name === 'Cost of Goods Sold'), [expenses]);
+  const opexItems = useMemo(() => expenses.filter((e: any) => e.expense_categories?.name !== 'Cost of Goods Sold'), [expenses]);
   const hasData = summary && summary.grossIncome;
 
   const tabs = [
@@ -369,6 +479,8 @@ export default function Dashboard() {
     { id: "reconcile", label: "Reconcile", icon: CheckCircle },
     { id: "balance", label: "Balance Sheet", icon: BarChart3 },
     { id: "expenses", label: "Expenses", icon: FileText },
+    { id: "coa", label: "Chart of Accts", icon: BarChart3 },
+    { id: "journal", label: "Journal Entries", icon: FileText },
     { id: "ask", label: "Ask AI", icon: MessageSquare },
   ];
 
@@ -558,12 +670,18 @@ export default function Dashboard() {
                   </div>
                   <div className="flex justify-between py-1.5 border-b border-gray-800/50">
                     <span className="text-sm text-gray-400">Line 36 · Beginning inventory (Jan 1)</span>
-                    <span className="text-sm font-mono text-gray-500 italic">$0.00</span>
+                    <span className="text-sm font-mono text-gray-200">{fmt(beginInv)}</span>
                   </div>
                   <div className="flex justify-between py-1.5 border-b border-gray-800/50">
                     <span className="text-sm text-gray-400">Line 37 · Purchases less personal use</span>
-                    <span className="text-sm font-mono text-gray-500 italic">$0.00</span>
+                    <span className={`text-sm font-mono ${cogsTotal > 0 ? "text-gray-200" : "text-gray-500 italic"}`}>{cogsTotal > 0 ? fmt(cogsTotal) : "$0.00"}</span>
                   </div>
+                  {cogsItems.map((item: any, i: number) => (
+                    <div key={i} className="flex justify-between py-1 border-b border-gray-800/30 pl-4">
+                      <span className="text-xs text-gray-500">{item.description || item.vendor}</span>
+                      <span className="text-xs font-mono text-gray-400">{fmt(Number(item.amount))}</span>
+                    </div>
+                  ))}
                   <div className="flex justify-between py-1.5 border-b border-gray-800/50">
                     <span className="text-sm text-gray-400">Line 38 · Cost of labor</span>
                     <span className="text-sm font-mono text-gray-500">$0.00</span>
@@ -578,16 +696,16 @@ export default function Dashboard() {
                   </div>
                   <div className="flex justify-between py-1.5 border-b border-gray-800/50">
                     <span className="text-sm text-gray-400">Line 41 · Add lines 36 through 40</span>
-                    <span className="text-sm font-mono text-gray-500 italic">$0.00</span>
+                    <span className="text-sm font-mono text-gray-200">{fmt(beginInv + cogsPurchases)}</span>
                   </div>
                   <div className="flex justify-between py-1.5 border-b border-gray-800/50">
                     <span className="text-sm text-gray-400">Line 42 · Ending inventory (Dec 31)</span>
-                    <span className="text-sm font-mono text-gray-500 italic">$0.00</span>
+                    <span className="text-sm font-mono text-gray-200">{fmt(endInv)}</span>
                   </div>
 
                   <div className="flex justify-between pt-3 mt-1">
                     <span className="text-sm font-bold text-amber-400">Line 4 · COGS (Line 41 minus Line 42)</span>
-                    <span className="text-base font-bold font-mono text-amber-400">{fmt(0)}</span>
+                    <span className="text-base font-bold font-mono text-amber-400">{fmt(actualCogs)}</span>
                   </div>
                   <p className="text-xs text-gray-600 mt-3">Upload credit card statements in Banking tab and tag sourcing purchases. Or add manually in Expenses tab under Cost of Goods Sold.</p>
                 </div>
@@ -596,9 +714,9 @@ export default function Dashboard() {
                 <div className="bg-indigo-500/5 border border-indigo-500/20 rounded-xl px-5 py-4">
                   <div className="flex justify-between items-center">
                     <span className="text-sm font-bold text-indigo-400">Line 5 · GROSS PROFIT</span>
-                    <span className="text-lg font-bold font-mono text-indigo-400">{fmt(Number(pnlData.gross_revenue))}</span>
+                    <span className="text-lg font-bold font-mono text-indigo-400">{fmt(Number(pnlData.gross_revenue) - actualCogs)}</span>
                   </div>
-                  <div className="text-xs text-gray-500 mt-1">Gross revenue minus COGS. Updates when COGS is entered.</div>
+                  <div className="text-xs text-gray-500 mt-1">Gross revenue ({fmt(Number(pnlData.gross_revenue))}) minus COGS ({fmt(actualCogs)})</div>
                 </div>
 
                 {/* ── SECTION 3: AMAZON SELLING FEES ── */}
@@ -631,26 +749,42 @@ export default function Dashboard() {
                 {/* ── SECTION 4: OTHER EXPENSES ── */}
                 <div className="bg-[#111827] border border-gray-800 rounded-xl p-5">
                   <div className="text-xs font-bold text-orange-400 uppercase tracking-wider mb-3">Other Expenses · Schedule C Lines 8–27</div>
-                  {[
-                    { label: "Line 9 · Car and truck expenses", sch: "Vehicle mileage at $0.70/mi", value: 0 },
-                    { label: "Line 15 · Insurance", sch: "Business insurance", value: 0 },
-                    { label: "Line 17 · Legal and professional", sch: "Tax prep, bookkeeping", value: 0 },
-                    { label: "Line 18 · Office expense", sch: "Supplies, printer ink", value: 0 },
-                    { label: "Line 22 · Supplies", sch: "Packaging, shipping supplies", value: 0 },
-                    { label: "Line 25 · Utilities", sch: "Internet (business portion)", value: 0 },
-                    { label: "Line 27a · Other expenses", sch: "Software, subscriptions", value: 0 },
-                  ].map(row => (
-                    <div key={row.label} className="flex justify-between items-center py-1.5 border-b border-gray-800/50">
-                      <div>
-                        <span className="text-sm text-gray-300">{row.label}</span>
-                        <span className="text-xs text-gray-600 ml-2">{row.sch}</span>
-                      </div>
-                      <span className="text-sm font-mono text-gray-500 italic">{row.value > 0 ? fmt(row.value) : "\u2014"}</span>
-                    </div>
-                  ))}
+                  {opexItems.length > 0 ? (
+                    <>
+                      {opexItems.map((item: any, i: number) => (
+                        <div key={i} className="flex justify-between items-center py-1.5 border-b border-gray-800/50">
+                          <div>
+                            <span className="text-sm text-gray-300">{item.expense_categories?.name || "Expense"}</span>
+                            <span className="text-xs text-gray-600 ml-2">{item.description}</span>
+                          </div>
+                          <span className="text-sm font-mono text-red-400">-{fmt(Number(item.amount))}</span>
+                        </div>
+                      ))}
+                    </>
+                  ) : (
+                    <>
+                      {[
+                        { label: "Line 9 · Car and truck expenses", sch: "Vehicle mileage at $0.70/mi" },
+                        { label: "Line 15 · Insurance", sch: "Business insurance" },
+                        { label: "Line 17 · Legal and professional", sch: "Tax prep, bookkeeping" },
+                        { label: "Line 18 · Office expense", sch: "Supplies, printer ink" },
+                        { label: "Line 22 · Supplies", sch: "Packaging, shipping supplies" },
+                        { label: "Line 25 · Utilities", sch: "Internet (business portion)" },
+                        { label: "Line 27a · Other expenses", sch: "Software, subscriptions" },
+                      ].map(row => (
+                        <div key={row.label} className="flex justify-between items-center py-1.5 border-b border-gray-800/50">
+                          <div>
+                            <span className="text-sm text-gray-300">{row.label}</span>
+                            <span className="text-xs text-gray-600 ml-2">{row.sch}</span>
+                          </div>
+                          <span className="text-sm font-mono text-gray-500 italic">{"\u2014"}</span>
+                        </div>
+                      ))}
+                    </>
+                  )}
                   <div className="flex justify-between pt-3 mt-1">
                     <span className="text-sm font-bold text-orange-400">TOTAL OTHER EXPENSES</span>
-                    <span className="text-base font-bold font-mono text-orange-400">{fmt(totalExpenses)}</span>
+                    <span className="text-base font-bold font-mono text-orange-400">-{fmt(operatingExpenses)}</span>
                   </div>
                   <p className="text-xs text-gray-600 mt-2">Add expenses in the Expenses tab or upload bank/credit card statements in Banking tab.</p>
                 </div>
@@ -670,14 +804,14 @@ export default function Dashboard() {
                 </div>
 
                 {/* ── NET PROFIT BOX ── */}
-                <div className={`rounded-xl p-5 border-2 ${Number(pnlData.net_amazon_profit) - totalExpenses >= 0 ? "bg-emerald-500/5 border-emerald-500/30" : "bg-red-500/5 border-red-500/30"}`}>
+                <div className={`rounded-xl p-5 border-2 ${Number(pnlData.net_amazon_profit) - actualCogs - operatingExpenses >= 0 ? "bg-emerald-500/5 border-emerald-500/30" : "bg-red-500/5 border-red-500/30"}`}>
                   <div className="flex justify-between items-center">
                     <div>
-                      <div className="text-sm font-bold text-white uppercase tracking-wider">Line 31 · NET PROFIT (before COGS)</div>
-                      <div className="text-xs text-gray-500 mt-1">Schedule C Line 31 = Gross Profit minus all expenses</div>
+                      <div className="text-sm font-bold text-white uppercase tracking-wider">Line 31 · NET PROFIT</div>
+                      <div className="text-xs text-gray-500 mt-1">Gross Profit minus Amazon Fees minus Expenses</div>
                     </div>
-                    <span className={`text-2xl font-bold font-mono ${Number(pnlData.net_amazon_profit) - totalExpenses >= 0 ? "text-emerald-400" : "text-red-400"}`}>
-                      {fmt(Number(pnlData.net_amazon_profit) - totalExpenses)}
+                    <span className={`text-2xl font-bold font-mono ${Number(pnlData.net_amazon_profit) - actualCogs - operatingExpenses >= 0 ? "text-emerald-400" : "text-red-400"}`}>
+                      {fmt(Number(pnlData.net_amazon_profit) - actualCogs - operatingExpenses)}
                     </span>
                   </div>
                   <div className="grid grid-cols-4 gap-3 mt-4 text-center">
@@ -687,7 +821,7 @@ export default function Dashboard() {
                     </div>
                     <div className="bg-black/20 rounded-lg p-2">
                       <div className="text-[10px] text-gray-500 uppercase">COGS</div>
-                      <div className="text-sm font-mono text-amber-400 mt-0.5">$0</div>
+                      <div className="text-sm font-mono text-amber-400 mt-0.5">-{fmt(actualCogs)}</div>
                     </div>
                     <div className="bg-black/20 rounded-lg p-2">
                       <div className="text-[10px] text-gray-500 uppercase">Amazon Fees</div>
@@ -695,7 +829,7 @@ export default function Dashboard() {
                     </div>
                     <div className="bg-black/20 rounded-lg p-2">
                       <div className="text-[10px] text-gray-500 uppercase">Expenses</div>
-                      <div className="text-sm font-mono text-orange-400 mt-0.5">-{fmt(totalExpenses)}</div>
+                      <div className="text-sm font-mono text-orange-400 mt-0.5">-{fmt(operatingExpenses)}</div>
                     </div>
                   </div>
                   <div className="mt-3 text-xs text-gray-600 text-center">Bank transfers to date: {fmt(Number(pnlData.bank_transfers))}</div>
@@ -1171,6 +1305,186 @@ export default function Dashboard() {
                 <div className="text-center py-12 text-gray-500 text-sm">No expenses yet. Add your first one above.</div>
               )}
             </div>
+          </div>
+        )}
+
+        {/* ── CHART OF ACCOUNTS TAB ──────────────────── */}
+        {tab === "coa" && (
+          <div>
+            <div className="flex justify-between items-center mb-4">
+              <div>
+                <h2 className="text-lg font-bold">Chart of Accounts</h2>
+                <p className="text-sm text-gray-500">{coaAccounts.length} accounts · Beginning balances and trial balance</p>
+              </div>
+            </div>
+
+            {/* Add/Edit form */}
+            <div className="bg-[#111827] border border-gray-800 rounded-xl p-4 mb-4">
+              <div className="text-xs font-bold text-gray-400 uppercase mb-3">{coaEditId ? "Edit Account" : "Add New Account"}</div>
+              <div className="grid grid-cols-6 gap-2">
+                <input placeholder="Acct #" className="bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-sm" value={coaForm.account_number} onChange={e => setCoaForm(p => ({ ...p, account_number: e.target.value }))} />
+                <input placeholder="Account Name" className="col-span-2 bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-sm" value={coaForm.account_name} onChange={e => setCoaForm(p => ({ ...p, account_name: e.target.value }))} />
+                <select className="bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-sm" value={coaForm.account_type} onChange={e => setCoaForm(p => ({ ...p, account_type: e.target.value }))}>
+                  <option value="asset">Asset</option><option value="liability">Liability</option><option value="equity">Equity</option><option value="income">Income</option><option value="expense">Expense</option>
+                </select>
+                <input placeholder="Beg. Balance" type="number" className="bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-sm" value={coaForm.beginning_balance} onChange={e => setCoaForm(p => ({ ...p, beginning_balance: e.target.value }))} />
+                <button onClick={saveCOAAccount} className="bg-indigo-600 hover:bg-indigo-500 rounded-lg text-sm font-medium transition">{coaEditId ? "Update" : "Add"}</button>
+              </div>
+            </div>
+
+            {/* Account list grouped by type */}
+            {["asset", "liability", "equity", "income", "expense"].map(type => {
+              const accts = coaAccounts.filter((a: any) => a.account_type === type);
+              if (accts.length === 0) return null;
+              const typeColors: any = { asset: "text-blue-400", liability: "text-red-400", equity: "text-purple-400", income: "text-emerald-400", expense: "text-orange-400" };
+              return (
+                <div key={type} className="mb-4">
+                  <div className={`text-xs font-bold uppercase tracking-wider mb-2 ${typeColors[type]}`}>{type}s</div>
+                  <div className="bg-[#111827] border border-gray-800 rounded-xl overflow-hidden">
+                    {accts.map((acct: any) => (
+                      <div key={acct.id} className="flex items-center px-4 py-2 border-b border-gray-800/50 hover:bg-gray-800/30 transition">
+                        <span className="text-xs font-mono text-gray-500 w-16">{acct.account_number}</span>
+                        <span className="text-sm flex-1">{acct.account_name}</span>
+                        <span className="text-xs text-gray-500 w-24 text-right">{acct.beginning_balance ? fmt(Number(acct.beginning_balance)) : "—"}</span>
+                        <button onClick={() => { setCoaEditId(acct.id); setCoaForm({ account_number: acct.account_number, account_name: acct.account_name, account_type: acct.account_type, description: acct.description || "", beginning_balance: String(acct.beginning_balance || 0) }); }}
+                          className="ml-3 text-xs text-indigo-400 hover:text-indigo-300">Edit</button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              );
+            })}
+
+            {/* Trial Balance */}
+            {trialBalance.length > 0 && (
+              <div className="mt-6">
+                <h3 className="text-sm font-bold text-cyan-400 uppercase tracking-wider mb-3">Trial Balance</h3>
+                <div className="bg-[#111827] border border-gray-800 rounded-xl overflow-hidden">
+                  <div className="grid grid-cols-5 gap-0 px-4 py-2 border-b border-gray-700 text-xs font-bold text-gray-500">
+                    <span>Account</span><span>Name</span><span className="text-right">Debits</span><span className="text-right">Credits</span><span className="text-right">Balance</span>
+                  </div>
+                  {trialBalance.filter((r: any) => Number(r.total_debits) !== 0 || Number(r.total_credits) !== 0 || Number(r.beginning_balance) !== 0).map((row: any) => (
+                    <div key={row.id} className="grid grid-cols-5 gap-0 px-4 py-1.5 border-b border-gray-800/30 text-xs">
+                      <span className="font-mono text-gray-500">{row.account_number}</span>
+                      <span className="text-gray-300">{row.account_name}</span>
+                      <span className="text-right font-mono text-gray-300">{Number(row.total_debits) > 0 ? fmt(Number(row.total_debits)) : "—"}</span>
+                      <span className="text-right font-mono text-gray-300">{Number(row.total_credits) > 0 ? fmt(Number(row.total_credits)) : "—"}</span>
+                      <span className={`text-right font-mono font-semibold ${Number(row.ending_balance) >= 0 ? "text-emerald-400" : "text-red-400"}`}>{fmt(Number(row.ending_balance))}</span>
+                    </div>
+                  ))}
+                  <div className="grid grid-cols-5 gap-0 px-4 py-2 border-t-2 border-gray-700 text-xs font-bold">
+                    <span></span><span className="text-cyan-400">TOTALS</span>
+                    <span className="text-right font-mono text-cyan-400">{fmt(trialBalance.reduce((s: number, r: any) => s + Number(r.total_debits), 0))}</span>
+                    <span className="text-right font-mono text-cyan-400">{fmt(trialBalance.reduce((s: number, r: any) => s + Number(r.total_credits), 0))}</span>
+                    <span></span>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ── JOURNAL ENTRIES TAB ────────────────────── */}
+        {tab === "journal" && (
+          <div>
+            <div className="flex justify-between items-center mb-4">
+              <div>
+                <h2 className="text-lg font-bold">Journal Entries</h2>
+                <p className="text-sm text-gray-500">{journalEntries.length} entries</p>
+              </div>
+              <button onClick={() => setShowJEForm(!showJEForm)} className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 rounded-lg text-sm font-medium transition">
+                <Plus size={14} className="inline mr-1" />{showJEForm ? "Cancel" : "New Entry"}
+              </button>
+            </div>
+
+            {/* New JE form */}
+            {showJEForm && (
+              <div className="bg-[#111827] border border-gray-800 rounded-xl p-5 mb-4">
+                <div className="text-xs font-bold text-indigo-400 uppercase mb-3">New Journal Entry</div>
+                <div className="grid grid-cols-3 gap-3 mb-4">
+                  <div>
+                    <label className="text-xs text-gray-500">Date</label>
+                    <input type="date" className="w-full bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-sm mt-1" value={jeForm.date} onChange={e => setJeForm(p => ({ ...p, date: e.target.value }))} />
+                  </div>
+                  <div className="col-span-2">
+                    <label className="text-xs text-gray-500">Memo</label>
+                    <input className="w-full bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-sm mt-1" placeholder="Description of entry" value={jeForm.memo} onChange={e => setJeForm(p => ({ ...p, memo: e.target.value }))} />
+                  </div>
+                </div>
+                <label className="flex items-center gap-2 mb-4 text-sm text-gray-400">
+                  <input type="checkbox" checked={jeForm.is_opening_balance} onChange={e => setJeForm(p => ({ ...p, is_opening_balance: e.target.checked }))} />
+                  Opening balance entry
+                </label>
+
+                {/* Line items */}
+                <div className="space-y-2 mb-3">
+                  <div className="grid grid-cols-12 gap-2 text-xs text-gray-500 px-1">
+                    <span className="col-span-5">Account</span><span className="col-span-2">Debit</span><span className="col-span-2">Credit</span><span className="col-span-3">Line Memo</span>
+                  </div>
+                  {jeForm.lines.map((line, i) => (
+                    <div key={i} className="grid grid-cols-12 gap-2">
+                      <select className="col-span-5 bg-gray-900 border border-gray-700 rounded-lg px-2 py-1.5 text-xs"
+                        value={line.account_id} onChange={e => { const lines = [...jeForm.lines]; lines[i].account_id = e.target.value; setJeForm(p => ({ ...p, lines })); }}>
+                        <option value="">Select account...</option>
+                        {coaAccounts.map((a: any) => <option key={a.id} value={a.id}>{a.account_number} — {a.account_name}</option>)}
+                      </select>
+                      <input type="number" placeholder="0.00" className="col-span-2 bg-gray-900 border border-gray-700 rounded-lg px-2 py-1.5 text-xs text-right"
+                        value={line.debit} onChange={e => { const lines = [...jeForm.lines]; lines[i].debit = e.target.value; if (e.target.value) lines[i].credit = ""; setJeForm(p => ({ ...p, lines })); }} />
+                      <input type="number" placeholder="0.00" className="col-span-2 bg-gray-900 border border-gray-700 rounded-lg px-2 py-1.5 text-xs text-right"
+                        value={line.credit} onChange={e => { const lines = [...jeForm.lines]; lines[i].credit = e.target.value; if (e.target.value) lines[i].debit = ""; setJeForm(p => ({ ...p, lines })); }} />
+                      <input placeholder="memo" className="col-span-3 bg-gray-900 border border-gray-700 rounded-lg px-2 py-1.5 text-xs"
+                        value={line.memo} onChange={e => { const lines = [...jeForm.lines]; lines[i].memo = e.target.value; setJeForm(p => ({ ...p, lines })); }} />
+                    </div>
+                  ))}
+                </div>
+
+                <div className="flex justify-between items-center">
+                  <button onClick={addJELine} className="text-xs text-indigo-400 hover:text-indigo-300">+ Add Line</button>
+                  <div className="flex items-center gap-4">
+                    <span className="text-xs text-gray-500">
+                      DR: {fmt(jeForm.lines.reduce((s, l) => s + (parseFloat(l.debit) || 0), 0))} | CR: {fmt(jeForm.lines.reduce((s, l) => s + (parseFloat(l.credit) || 0), 0))}
+                      {Math.abs(jeForm.lines.reduce((s, l) => s + (parseFloat(l.debit) || 0), 0) - jeForm.lines.reduce((s, l) => s + (parseFloat(l.credit) || 0), 0)) < 0.01
+                        ? <span className="text-emerald-400 ml-2">Balanced</span>
+                        : <span className="text-red-400 ml-2">Not balanced</span>}
+                    </span>
+                    <button onClick={saveJournalEntry} className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 rounded-lg text-sm font-medium transition">Post Entry</button>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Entry list */}
+            {journalEntries.length > 0 ? (
+              <div className="space-y-2">
+                {journalEntries.map((je: any) => (
+                  <div key={je.id} className="bg-[#111827] border border-gray-800 rounded-xl p-4">
+                    <div className="flex justify-between items-center mb-2">
+                      <div className="flex items-center gap-3">
+                        <span className="text-xs font-mono text-gray-500">{je.entry_date}</span>
+                        <span className="text-xs font-mono text-gray-600">#{je.entry_number}</span>
+                        {je.is_opening_balance && <span className="text-[10px] bg-purple-900/30 text-purple-400 px-2 py-0.5 rounded">Opening Balance</span>}
+                        {je.is_adjusting && <span className="text-[10px] bg-amber-900/30 text-amber-400 px-2 py-0.5 rounded">Adjusting</span>}
+                      </div>
+                      <span className={`text-[10px] px-2 py-0.5 rounded ${je.status === 'posted' ? 'bg-emerald-900/30 text-emerald-400' : je.status === 'void' ? 'bg-red-900/30 text-red-400' : 'bg-gray-800 text-gray-400'}`}>{je.status}</span>
+                    </div>
+                    {je.memo && <div className="text-sm text-gray-400 mb-2">{je.memo}</div>}
+                    <div className="space-y-1">
+                      {je.journal_entry_lines?.map((line: any, i: number) => (
+                        <div key={i} className="flex items-center text-xs">
+                          <span className={`w-6 ${Number(line.credit) > 0 ? "ml-4" : ""}`}></span>
+                          <span className="font-mono text-gray-500 w-12">{line.chart_of_accounts?.account_number}</span>
+                          <span className="flex-1 text-gray-300">{line.chart_of_accounts?.account_name}</span>
+                          <span className="w-24 text-right font-mono text-gray-300">{Number(line.debit) > 0 ? fmt(Number(line.debit)) : ""}</span>
+                          <span className="w-24 text-right font-mono text-gray-300">{Number(line.credit) > 0 ? fmt(Number(line.credit)) : ""}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="text-center py-16 text-gray-500 text-sm">No journal entries yet. Click "New Entry" to create one.</div>
+            )}
           </div>
         )}
 
