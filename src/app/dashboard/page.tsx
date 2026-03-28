@@ -68,6 +68,9 @@ export default function Dashboard() {
   const [bankFilter, setBankFilter] = useState<"all" | "unreviewed" | "business" | "personal">("all");
   const [bankUploading, setBankUploading] = useState(false);
   const [bankMsg, setBankMsg] = useState("");
+  const [bankAccounts, setBankAccounts] = useState<any[]>([]);
+  const [selectedBankAcct, setSelectedBankAcct] = useState<string | null>(null);
+  const [bankImportHistory, setBankImportHistory] = useState<any[]>([]);
 
   // Reconciliation
   const [reconData, setReconData] = useState<any>(null);
@@ -144,6 +147,8 @@ export default function Dashboard() {
     loadExpenses();
     loadBalanceSheet();
     loadBankTransactions();
+    loadBankAccounts();
+    loadBankImportHistory();
     loadReconciliation();
     loadPnl();
     loadK1099();
@@ -222,6 +227,16 @@ export default function Dashboard() {
       .order("date", { ascending: false })
       .limit(500);
     if (data) setBankTxns(data);
+  };
+
+  const loadBankAccounts = async () => {
+    const { data } = await supabase.from("bank_accounts").select("*").order("sort_order");
+    if (data) setBankAccounts(data);
+  };
+
+  const loadBankImportHistory = async () => {
+    const { data } = await supabase.from("bank_imports").select("*").order("uploaded_at", { ascending: false }).limit(50);
+    if (data) setBankImportHistory(data);
   };
 
   const loadReconciliation = async (from?: string, to?: string) => {
@@ -493,9 +508,14 @@ export default function Dashboard() {
       if (result.error) { setBankMsg(`Error: ${result.error}`); setBankUploading(false); return; }
       setBankMsg(`Found ${result.rowCount} transactions (${result.bankDetected}). Saving...`);
 
+      // Get selected account name for display
+      const selectedAcctObj = bankAccounts.find((a: any) => a.id === selectedBankAcct);
+      const acctName = selectedAcctObj ? selectedAcctObj.account_name : file.name.replace(/\.[^.]+$/, '');
+      const acctType = selectedAcctObj ? selectedAcctObj.account_type : result.accountType;
+
       const { data: bankImport, error: impErr } = await supabase
         .from("bank_imports")
-        .insert({ user_id: user.id, filename: file.name, account_name: file.name.replace(/\.[^.]+$/, ''), account_type: result.accountType, row_count: result.rowCount, status: "completed" })
+        .insert({ user_id: user.id, filename: file.name, account_name: acctName, account_type: acctType, row_count: result.rowCount, status: "completed", bank_account_id: selectedBankAcct || null })
         .select().single();
       if (impErr) throw impErr;
 
@@ -511,8 +531,67 @@ export default function Dashboard() {
         if (batchErr && !batchErr.message?.includes("duplicate")) console.warn("Bank batch error:", batchErr.message);
         setBankMsg(`Saved ${Math.min(i + 500, txRows.length)} of ${txRows.length}...`);
       }
-      setBankMsg(`Done! ${result.rowCount} transactions imported (duplicates skipped).`);
+
+      // ═══ AUTO-CATEGORIZE: detect sourcing purchases and create purchase orders ═══
+      const sourcingPatterns = ['goodwill', 'thrift', 'salvation army', 'library sale', 'book sale', 'yard sale', 'estate sale', 'half price books', 'savers', 'deseret', 'arc thrift', 'value village', 'st vincent'];
+      const sourcingTxns = result.transactions.filter((tx: any) => {
+        const desc = (tx.description || '').toLowerCase();
+        return sourcingPatterns.some(p => desc.includes(p)) && tx.amount < 0;
+      });
+
+      if (sourcingTxns.length > 0) {
+        setBankMsg(`Found ${sourcingTxns.length} sourcing purchases. Creating purchase orders...`);
+        let poCount = 0;
+        for (const tx of sourcingTxns) {
+          const total = Math.abs(tx.amount);
+          const desc = tx.description || '';
+          // Detect source type
+          let sourceType = 'thrift';
+          const descLower = desc.toLowerCase();
+          if (descLower.includes('library') || descLower.includes('book sale')) sourceType = 'library';
+          else if (descLower.includes('half price')) sourceType = 'other';
+          else if (descLower.includes('estate')) sourceType = 'other';
+          else if (descLower.includes('yard') || descLower.includes('garage')) sourceType = 'other';
+
+          // Create purchase order (skip if already exists for same vendor+date+amount)
+          const { error: poErr } = await supabase.from("purchase_orders").upsert({
+            user_id: user.id, vendor: desc.slice(0, 100), purchase_date: tx.date,
+            source_type: sourceType, subtotal: total, tax: 0, total: total,
+            payment_method: 'credit_card', notes: `Auto-imported from ${file.name}`,
+            status: 'completed',
+          }, { onConflict: "user_id,vendor,purchase_date,total", ignoreDuplicates: true });
+          if (!poErr) poCount++;
+
+          // Also auto-create an expense entry for COGS
+          const { data: cogsCat } = await supabase.from("expense_categories").select("id").eq("name", "Cost of Goods Sold").limit(1);
+          if (cogsCat && cogsCat[0]) {
+            await supabase.from("expense_transactions").upsert({
+              user_id: user.id, category_id: cogsCat[0].id, date: tx.date,
+              amount: total, vendor: desc.slice(0, 100), description: `Sourcing purchase — ${desc.slice(0, 60)}`,
+            }, { onConflict: "user_id,date,amount,vendor", ignoreDuplicates: true });
+          }
+        }
+        setBankMsg(`Done! ${result.rowCount} transactions imported. ${poCount} sourcing purchases auto-added to Purchases tab & COGS.`);
+      } else {
+        setBankMsg(`Done! ${result.rowCount} transactions imported (duplicates skipped).`);
+      }
+
+      // Auto-tag known categories as business
+      const businessPatterns = [...sourcingPatterns, 'usps', 'ups store', 'fedex', 'stamps.com', 'pirate ship', 'uline', 'staples', 'office depot', 'accelerlist', 'inventory lab', 'keepa', 'scoutiq', 'amazon payments', 'amzn mktp', 'amazon services'];
+      const { data: importedTxns } = await supabase.from("bank_transactions").select("id, description").eq("import_id", bankImport.id).is("is_business", null);
+      if (importedTxns) {
+        const businessIds = importedTxns.filter((t: any) => businessPatterns.some(p => (t.description || '').toLowerCase().includes(p))).map((t: any) => t.id);
+        if (businessIds.length > 0) {
+          for (let i = 0; i < businessIds.length; i += 100) {
+            await supabase.from("bank_transactions").update({ is_business: true, manually_reviewed: false, category_suggestion: "auto-tagged" }).in("id", businessIds.slice(i, i + 100));
+          }
+        }
+      }
+
       await loadBankTransactions();
+      await loadBankImportHistory();
+      await loadPurchases();
+      await loadExpenses();
     } catch (err: any) { setBankMsg(`Error: ${err.message}`); }
     finally { setBankUploading(false); }
   }, [user, supabase]);
@@ -1256,20 +1335,82 @@ export default function Dashboard() {
             <div className="flex justify-between items-center mb-4">
               <div>
                 <h2 className="text-lg font-bold">Bank & Credit Card Transactions</h2>
-                <p className="text-sm text-gray-500">Upload CSV statements, tag business vs personal, auto-categorize</p>
+                <p className="text-sm text-gray-500">Upload CSV statements, tag business vs personal, auto-categorize sourcing purchases</p>
               </div>
+              <button onClick={async () => {
+                const name = prompt("Account name (e.g., Chase Visa 4521):");
+                if (!name || !user) return;
+                const type = prompt("Type: checking, savings, or credit_card") || "credit_card";
+                const inst = prompt("Institution (e.g., Chase, BofA, Capital One):") || "";
+                const last4 = prompt("Last 4 digits:") || "";
+                await supabase.from("bank_accounts").insert({ user_id: user.id, account_name: name, account_type: type, institution: inst, last_four: last4 });
+                // Also add to COA if credit card
+                if (type === "credit_card") {
+                  const existingMax = coaAccounts.filter((a: any) => a.account_number?.startsWith("21")).sort().pop();
+                  const nextNum = existingMax ? String(parseInt(existingMax.account_number) + 10) : "2110";
+                  await supabase.from("chart_of_accounts").insert({ user_id: user.id, account_number: nextNum, account_name: `CC — ${name}`, account_type: "liability", is_active: true, beginning_balance: 0 });
+                  await loadCOA();
+                }
+                const { data } = await supabase.from("bank_accounts").select("*").eq("user_id", user.id).order("sort_order");
+                if (data) setBankAccounts(data);
+              }} className="px-3 py-2 bg-indigo-600 hover:bg-indigo-500 rounded-lg text-xs font-medium transition">
+                <Plus size={12} className="inline mr-1" />Add Account
+              </button>
             </div>
 
-            {/* Bank upload */}
+            {/* Account list */}
+            {bankAccounts.length > 0 && (
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mb-4">
+                {bankAccounts.map((acct: any) => (
+                  <div key={acct.id} className={`bg-[#111827] border rounded-xl p-3 cursor-pointer transition ${selectedBankAcct === acct.id ? "border-indigo-500" : "border-gray-800 hover:border-gray-600"}`}
+                    onClick={() => setSelectedBankAcct(selectedBankAcct === acct.id ? null : acct.id)}>
+                    <div className="flex items-center gap-2">
+                      <div className={`w-2 h-2 rounded-full ${acct.account_type === 'credit_card' ? 'bg-red-400' : acct.account_type === 'savings' ? 'bg-blue-400' : 'bg-emerald-400'}`} />
+                      <span className="text-xs font-medium truncate">{acct.account_name}</span>
+                    </div>
+                    <div className="text-[10px] text-gray-500 mt-1">{acct.institution} {acct.last_four ? `···${acct.last_four}` : ""} · {acct.account_type}</div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* Bank upload — now with account selector */}
             <div className="bg-[#111827] border border-gray-800 rounded-xl p-4 mb-4">
-              <label className="block border-2 border-dashed border-gray-700 hover:border-indigo-500 rounded-lg p-6 text-center cursor-pointer transition">
+              {bankAccounts.length > 0 && (
+                <div className="mb-3">
+                  <label className="text-xs text-gray-500 font-medium">Upload to account:</label>
+                  <select className="ml-2 bg-gray-900 border border-gray-700 rounded-lg px-3 py-1.5 text-sm" value={selectedBankAcct || ""} onChange={e => setSelectedBankAcct(e.target.value || null)}>
+                    <option value="">— Select account first —</option>
+                    {bankAccounts.map((a: any) => <option key={a.id} value={a.id}>{a.account_name} ({a.account_type})</option>)}
+                  </select>
+                </div>
+              )}
+              <label className={`block border-2 border-dashed rounded-lg p-6 text-center transition ${bankAccounts.length > 0 && !selectedBankAcct ? "border-gray-800 opacity-50 cursor-not-allowed" : "border-gray-700 hover:border-indigo-500 cursor-pointer"}`}>
                 <Landmark size={24} className="mx-auto mb-2 text-gray-500" />
-                <div className="text-sm font-medium mb-1">Upload bank or credit card CSV</div>
+                <div className="text-sm font-medium mb-1">{bankAccounts.length > 0 && !selectedBankAcct ? "Select an account above first" : "Upload bank or credit card CSV"}</div>
                 <div className="text-xs text-gray-500">Supports Chase, Bank of America, Wells Fargo, Capital One, and generic CSV</div>
-                <input type="file" accept=".csv,.tsv,.txt" onChange={handleBankUpload} className="hidden" disabled={bankUploading} />
+                <input type="file" accept=".csv,.tsv,.txt" onChange={handleBankUpload} className="hidden" disabled={bankUploading || (bankAccounts.length > 0 && !selectedBankAcct)} />
               </label>
-              {bankMsg && <div className={`mt-2 text-sm text-center ${bankMsg.startsWith("Error") ? "text-red-400" : bankMsg.startsWith("Done") ? "text-emerald-400" : "text-indigo-400"}`}>{bankMsg}</div>}
+              {bankMsg && <div className={`mt-2 text-sm text-center ${bankMsg.startsWith("Error") ? "text-red-400" : bankMsg.startsWith("Done") || bankMsg.startsWith("Found") ? "text-emerald-400" : "text-indigo-400"}`}>{bankMsg}</div>}
             </div>
+
+            {/* Upload history */}
+            {bankImportHistory.length > 0 && (
+              <div className="bg-[#111827] border border-gray-800 rounded-xl p-4 mb-4">
+                <div className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">Upload History — {bankImportHistory.length} files uploaded</div>
+                <div className="space-y-1">
+                  {bankImportHistory.map((imp: any) => (
+                    <div key={imp.id} className="flex items-center text-xs py-1.5 border-b border-gray-800/30">
+                      <CheckCircle size={12} className="text-emerald-500 mr-2 shrink-0" />
+                      <span className="font-mono text-gray-500 w-28 shrink-0">{imp.uploaded_at?.slice(0, 10)}</span>
+                      <span className="flex-1 truncate text-gray-300">{imp.filename}</span>
+                      <span className="text-gray-500 w-20 text-right">{imp.account_name}</span>
+                      <span className="text-gray-500 w-16 text-right">{imp.row_count} rows</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
 
             {/* Stats bar */}
             {bankTxns.length > 0 && (
