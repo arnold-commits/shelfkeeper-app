@@ -2,6 +2,7 @@
 import { useState, useCallback, useMemo, useEffect } from "react";
 import { createClient } from "@/lib/supabase";
 import { parseSettlementReport } from "@/lib/settlement-parser";
+import { parseInventoryReport } from "@/lib/inventory-parser";
 
 type ParseResult = {
   error?: string;
@@ -98,6 +99,31 @@ export default function Dashboard() {
   const [showInvEdit, setShowInvEdit] = useState(false);
   const [invForm, setInvForm] = useState({ beginDate: "2025-01-01", beginValue: "79104", beginItems: "15821", endDate: "2025-12-31", endValue: "70000", endItems: "14000" });
 
+  // Purchases (purchase_orders table)
+  const [purchases, setPurchases] = useState<any[]>([]);
+  const [showPoForm, setShowPoForm] = useState(false);
+  const [poForm, setPoForm] = useState({ vendor: "", purchase_date: new Date().toISOString().slice(0, 10), source_type: "thrift", subtotal: "", tax: "", payment_method: "credit_card", notes: "" });
+
+  // Inventory Items
+  const [invItems, setInvItems] = useState<any[]>([]);
+  const [showInvForm, setShowInvForm] = useState(false);
+  const [invItemForm, setInvItemForm] = useState({ sku: "", asin: "", title: "", purchase_date: new Date().toISOString().slice(0,10), purchase_price: "", quantity_purchased: "1", source: "thrift", source_name: "", condition: "Used - Good", list_price: "", notes: "" });
+
+  // Purchase Batches
+  const [batches, setBatches] = useState<any[]>([]);
+  const [showBatchForm, setShowBatchForm] = useState(false);
+  const [batchForm, setBatchForm] = useState({ batch_date: new Date().toISOString().slice(0,10), source_type: "thrift", source_name: "", total_cost: "", item_count: "", payment_method: "credit_card", notes: "" });
+
+  // Mileage
+  const [mileageLogs, setMileageLogs] = useState<any[]>([]);
+  const [mileageSummary, setMileageSummary] = useState<any>(null);
+  const [showMileageForm, setShowMileageForm] = useState(false);
+  const [mileageForm, setMileageForm] = useState({ trip_date: new Date().toISOString().slice(0,10), purpose: "sourcing", from_location: "", to_location: "", miles: "", is_round_trip: false, notes: "" });
+  const [invUploading, setInvUploading] = useState(false);
+  const [invMsg, setInvMsg] = useState("");
+  const [invSummary, setInvSummary] = useState<any>(null);
+  const [defaultCost, setDefaultCost] = useState("5.00");
+
   // Inventory snapshots
   const [beginInv, setBeginInv] = useState(0);
   const [endInv, setEndInv] = useState(0);
@@ -125,6 +151,10 @@ export default function Dashboard() {
     loadCOA();
     loadJournalEntries();
     loadTrialBalance();
+    loadInvItems();
+    loadBatches();
+    loadMileage();
+    loadPurchases();
   }, [user]);
 
   const loadData = async () => {
@@ -336,6 +366,119 @@ export default function Dashboard() {
     await loadInventory();
     await loadPnl();
     alert("Inventory saved!");
+  };
+
+  // Inventory report upload handler
+  const handleInventoryUpload = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file || !user) return;
+    setInvUploading(true);
+    setInvMsg("Parsing inventory report...");
+    try {
+      const text = await file.text();
+      const result = parseInventoryReport(text) as any;
+      if (result.error) { setInvMsg(`Error: ${result.error}`); setInvUploading(false); return; }
+
+      setInvMsg(`Found ${result.summary?.uniqueSkus} SKUs, ${result.summary?.totalUnits} total units (${result.format}). Saving...`);
+      const snapshotDate = result.snapshotDate || new Date().toISOString().slice(0, 10);
+      const cost = parseFloat(defaultCost) || 5.00;
+
+      // Batch insert inventory counts
+      const rows = result.items.map((item: any) => ({
+        user_id: user.id, snapshot_date: snapshotDate, sku: item.sku, fnsku: item.fnsku,
+        asin: item.asin, product_name: item.title, quantity_sellable: item.disposition === "SELLABLE" ? item.quantity : 0,
+        quantity_unsellable: item.disposition !== "SELLABLE" ? item.quantity : 0,
+        quantity_total: item.quantity, fulfillment_center: item.fc, disposition: item.disposition,
+      }));
+
+      for (let i = 0; i < rows.length; i += 500) {
+        await supabase.from("inventory_counts").upsert(rows.slice(i, i + 500), { onConflict: "user_id,snapshot_date,sku,fulfillment_center", ignoreDuplicates: false });
+      }
+
+      // Also upsert SKU costs for items that don't have a cost yet (using default avg cost)
+      const skuCosts = [...new Map(result.items.map((item: any) => [item.sku, item])).values()].map((item: any) => ({
+        user_id: user.id, sku: item.sku, asin: item.asin, product_name: item.title,
+        unit_cost: cost, source: "avg_cost", notes: `Default avg cost $${cost.toFixed(2)}`,
+      }));
+      for (let i = 0; i < skuCosts.length; i += 500) {
+        await supabase.from("sku_costs").upsert(skuCosts.slice(i, i + 500), { onConflict: "user_id,sku", ignoreDuplicates: true });
+      }
+
+      // Update inventory snapshot total
+      const totalValue = result.summary!.totalSellable * cost;
+      await supabase.from("inventory_snapshots").upsert({
+        user_id: user.id, snapshot_date: snapshotDate, total_value: totalValue,
+        item_count: result.summary!.totalUnits, snapshot_type: "report",
+        notes: `From ${file.name}: ${result.summary!.uniqueSkus} SKUs, ${result.summary!.totalUnits} units × $${cost.toFixed(2)} avg`,
+      }, { onConflict: "user_id,snapshot_date" });
+
+      setInvSummary({ ...result.summary, snapshotDate, totalValue, cost });
+      setInvMsg(`Done! ${result.summary!.uniqueSkus} SKUs, ${result.summary!.totalUnits} units. Valued at $${totalValue.toLocaleString()} ($${cost.toFixed(2)}/unit avg).`);
+      await loadInventory();
+      await loadBalanceSheet();
+    } catch (err: any) { setInvMsg(`Error: ${err.message}`); }
+    finally { setInvUploading(false); }
+  }, [user, supabase, defaultCost]);
+
+  // Load inventory items
+  const loadInvItems = async () => {
+    const { data } = await supabase.from("inventory_items").select("*").order("purchase_date", { ascending: false }).limit(200);
+    if (data) setInvItems(data);
+  };
+  const saveInvItem = async () => {
+    if (!user || !invItemForm.title) return;
+    await supabase.from("inventory_items").insert({
+      user_id: user.id, sku: invItemForm.sku, asin: invItemForm.asin, title: invItemForm.title,
+      purchase_date: invItemForm.purchase_date, purchase_price: parseFloat(invItemForm.purchase_price) || 0,
+      quantity_purchased: parseInt(invItemForm.quantity_purchased) || 1,
+      source: invItemForm.source, source_name: invItemForm.source_name,
+      condition: invItemForm.condition, list_price: parseFloat(invItemForm.list_price) || null, notes: invItemForm.notes,
+    });
+    setShowInvForm(false);
+    setInvItemForm({ sku: "", asin: "", title: "", purchase_date: new Date().toISOString().slice(0,10), purchase_price: "", quantity_purchased: "1", source: "thrift", source_name: "", condition: "Used - Good", list_price: "", notes: "" });
+    await loadInvItems();
+  };
+
+  // Load purchase batches
+  const loadBatches = async () => {
+    const { data } = await supabase.from("purchase_batches").select("*").order("batch_date", { ascending: false }).limit(100);
+    if (data) setBatches(data);
+  };
+  const saveBatch = async () => {
+    if (!user || !batchForm.total_cost) return;
+    await supabase.from("purchase_batches").insert({
+      user_id: user.id, batch_date: batchForm.batch_date, source_type: batchForm.source_type,
+      source_name: batchForm.source_name, total_cost: parseFloat(batchForm.total_cost) || 0,
+      item_count: parseInt(batchForm.item_count) || 0, payment_method: batchForm.payment_method, notes: batchForm.notes,
+    });
+    setShowBatchForm(false);
+    setBatchForm({ batch_date: new Date().toISOString().slice(0,10), source_type: "thrift", source_name: "", total_cost: "", item_count: "", payment_method: "credit_card", notes: "" });
+    await loadBatches();
+  };
+
+  // Load mileage
+  const loadMileage = async () => {
+    const { data } = await supabase.from("mileage_logs").select("*").order("trip_date", { ascending: false }).limit(200);
+    if (data) setMileageLogs(data);
+    const { data: summary } = await supabase.from("v_mileage_summary").select("*");
+    if (summary && summary.length > 0) setMileageSummary(summary[0]);
+  };
+  const saveMileage = async () => {
+    if (!user || !mileageForm.miles) return;
+    const totalMiles = parseFloat(mileageForm.miles) * (mileageForm.is_round_trip ? 2 : 1);
+    await supabase.from("mileage_logs").insert({
+      user_id: user.id, trip_date: mileageForm.trip_date, purpose: mileageForm.purpose,
+      from_location: mileageForm.from_location, to_location: mileageForm.to_location,
+      miles: totalMiles, is_round_trip: mileageForm.is_round_trip, notes: mileageForm.notes,
+    });
+    setShowMileageForm(false);
+    setMileageForm({ trip_date: new Date().toISOString().slice(0,10), purpose: "sourcing", from_location: "", to_location: "", miles: "", is_round_trip: false, notes: "" });
+    await loadMileage();
+  };
+
+  const loadPurchases = async () => {
+    const { data } = await supabase.from("purchase_orders").select("*").order("purchase_date", { ascending: false }).limit(200);
+    if (data) setPurchases(data);
   };
 
   // Bank CSV upload handler
@@ -550,6 +693,9 @@ export default function Dashboard() {
     { id: "expenses", label: "Expenses", icon: FileText },
     { id: "coa", label: "Chart of Accts", icon: BarChart3 },
     { id: "journal", label: "Journal Entries", icon: FileText },
+    { id: "inventory", label: "Inventory", icon: Package },
+    { id: "purchases", label: "Purchases", icon: DollarSign },
+    { id: "mileage", label: "Mileage", icon: TrendingUp },
     { id: "ask", label: "Ask AI", icon: MessageSquare },
   ];
 
@@ -1423,6 +1569,47 @@ export default function Dashboard() {
             ) : (
               <div className="text-center py-16 text-gray-500">Upload a settlement report and add expenses to generate your balance sheet.</div>
             )}
+
+            {/* ── INVENTORY MANAGEMENT ── */}
+            <div className="mt-6">
+              <div className="bg-[#111827] border border-gray-800 rounded-xl p-5">
+                <div className="flex justify-between items-center mb-4">
+                  <div>
+                    <div className="text-xs font-bold text-amber-400 uppercase tracking-wider">Inventory Management</div>
+                    <p className="text-xs text-gray-500 mt-1">Upload Amazon inventory report or set values manually</p>
+                  </div>
+                  {invSummary && (
+                    <div className="text-right text-xs text-gray-400">
+                      <div>{invSummary.uniqueSkus} SKUs · {invSummary.totalUnits?.toLocaleString()} units</div>
+                      <div className="font-mono text-amber-400">{fmt(invSummary.totalValue)}</div>
+                    </div>
+                  )}
+                </div>
+
+                {/* Upload inventory report */}
+                <div className="grid grid-cols-2 gap-4 mb-4">
+                  <div>
+                    <label className="block border border-dashed border-gray-700 hover:border-amber-500 rounded-lg p-4 text-center cursor-pointer transition">
+                      <Upload size={20} className="mx-auto mb-2 text-gray-500" />
+                      <div className="text-xs font-medium">Upload Inventory Report</div>
+                      <div className="text-[10px] text-gray-600 mt-1">Event Detail, Manage Inventory, or Ledger Summary (CSV/TSV)</div>
+                      <input type="file" accept=".csv,.tsv,.txt" onChange={handleInventoryUpload} className="hidden" disabled={invUploading} />
+                    </label>
+                  </div>
+                  <div className="space-y-2">
+                    <div>
+                      <label className="text-[10px] text-gray-500">Default Cost Per Unit ($)</label>
+                      <input type="number" step="0.01" className="w-full bg-gray-900 border border-gray-700 rounded px-3 py-1.5 text-sm mt-1" value={defaultCost} onChange={e => setDefaultCost(e.target.value)} />
+                      <p className="text-[10px] text-gray-600 mt-1">Used for SKUs without a set cost. Booksellers: $3-7 avg. Private label: set per SKU below.</p>
+                    </div>
+                  </div>
+                </div>
+
+                {invMsg && (
+                  <div className={`text-xs text-center py-2 rounded ${invMsg.startsWith("Error") ? "text-red-400 bg-red-900/20" : invMsg.startsWith("Done") ? "text-emerald-400 bg-emerald-900/20" : "text-indigo-400"}`}>{invMsg}</div>
+                )}
+              </div>
+            </div>
           </div>
         )}
 
@@ -1666,6 +1853,292 @@ export default function Dashboard() {
             ) : (
               <div className="text-center py-16 text-gray-500 text-sm">No journal entries yet. Click "New Entry" to create one.</div>
             )}
+          </div>
+        )}
+
+        {/* ── INVENTORY TAB ──────────────────────────── */}
+        {tab === "inventory" && (
+          <div>
+            <div className="flex justify-between items-center mb-4">
+              <div>
+                <h2 className="text-lg font-bold">Inventory & Purchases</h2>
+                <p className="text-sm text-gray-500">{invItems.length} items tracked · {batches.length} purchase batches</p>
+              </div>
+              <div className="flex gap-2">
+                <button onClick={() => setShowBatchForm(!showBatchForm)} className="px-3 py-2 bg-amber-600 hover:bg-amber-500 rounded-lg text-xs font-medium transition">
+                  <Plus size={12} className="inline mr-1" />Add Batch
+                </button>
+                <button onClick={() => setShowInvForm(!showInvForm)} className="px-3 py-2 bg-indigo-600 hover:bg-indigo-500 rounded-lg text-xs font-medium transition">
+                  <Plus size={12} className="inline mr-1" />Add Item
+                </button>
+              </div>
+            </div>
+
+            {/* Purchase batch form */}
+            {showBatchForm && (
+              <div className="bg-[#111827] border border-gray-800 rounded-xl p-4 mb-4">
+                <div className="text-xs font-bold text-amber-400 uppercase mb-3">New Purchase Batch (Sourcing Trip)</div>
+                <div className="grid grid-cols-4 gap-3 mb-3">
+                  <div><label className="text-[10px] text-gray-500">Date</label><input type="date" className="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs mt-1" value={batchForm.batch_date} onChange={e => setBatchForm(p => ({...p, batch_date: e.target.value}))} /></div>
+                  <div><label className="text-[10px] text-gray-500">Source Type</label>
+                    <select className="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs mt-1" value={batchForm.source_type} onChange={e => setBatchForm(p => ({...p, source_type: e.target.value}))}>
+                      <option value="thrift">Thrift Store</option><option value="wholesale">Wholesale</option><option value="online">Online Arbitrage</option><option value="library_sale">Library Sale</option><option value="garage_sale">Garage Sale</option><option value="retail">Retail Arbitrage</option>
+                    </select></div>
+                  <div><label className="text-[10px] text-gray-500">Store Name</label><input className="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs mt-1" placeholder="e.g., Goodwill Henderson" value={batchForm.source_name} onChange={e => setBatchForm(p => ({...p, source_name: e.target.value}))} /></div>
+                  <div><label className="text-[10px] text-gray-500">Payment</label>
+                    <select className="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs mt-1" value={batchForm.payment_method} onChange={e => setBatchForm(p => ({...p, payment_method: e.target.value}))}>
+                      <option value="credit_card">Credit Card</option><option value="debit">Debit Card</option><option value="cash">Cash</option>
+                    </select></div>
+                </div>
+                <div className="grid grid-cols-3 gap-3 mb-3">
+                  <div><label className="text-[10px] text-gray-500">Total Cost ($)</label><input type="number" className="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs mt-1" placeholder="125.00" value={batchForm.total_cost} onChange={e => setBatchForm(p => ({...p, total_cost: e.target.value}))} /></div>
+                  <div><label className="text-[10px] text-gray-500"># Items</label><input type="number" className="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs mt-1" placeholder="25" value={batchForm.item_count} onChange={e => setBatchForm(p => ({...p, item_count: e.target.value}))} /></div>
+                  <div><label className="text-[10px] text-gray-500">Notes</label><input className="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs mt-1" placeholder="Optional" value={batchForm.notes} onChange={e => setBatchForm(p => ({...p, notes: e.target.value}))} /></div>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-xs text-gray-500">{batchForm.total_cost && batchForm.item_count ? `Avg cost: $${(parseFloat(batchForm.total_cost) / parseInt(batchForm.item_count)).toFixed(2)}/item` : ""}</span>
+                  <button onClick={saveBatch} className="px-4 py-1.5 bg-amber-600 hover:bg-amber-500 rounded-lg text-xs font-medium">Save Batch</button>
+                </div>
+              </div>
+            )}
+
+            {/* Add item form */}
+            {showInvForm && (
+              <div className="bg-[#111827] border border-gray-800 rounded-xl p-4 mb-4">
+                <div className="text-xs font-bold text-indigo-400 uppercase mb-3">Add Inventory Item</div>
+                <div className="grid grid-cols-4 gap-3 mb-3">
+                  <div><label className="text-[10px] text-gray-500">SKU</label><input className="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs mt-1" value={invItemForm.sku} onChange={e => setInvItemForm(p => ({...p, sku: e.target.value}))} /></div>
+                  <div><label className="text-[10px] text-gray-500">ASIN</label><input className="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs mt-1" value={invItemForm.asin} onChange={e => setInvItemForm(p => ({...p, asin: e.target.value}))} /></div>
+                  <div className="col-span-2"><label className="text-[10px] text-gray-500">Title</label><input className="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs mt-1" value={invItemForm.title} onChange={e => setInvItemForm(p => ({...p, title: e.target.value}))} /></div>
+                </div>
+                <div className="grid grid-cols-5 gap-3 mb-3">
+                  <div><label className="text-[10px] text-gray-500">Purchase Date</label><input type="date" className="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs mt-1" value={invItemForm.purchase_date} onChange={e => setInvItemForm(p => ({...p, purchase_date: e.target.value}))} /></div>
+                  <div><label className="text-[10px] text-gray-500">Cost ($)</label><input type="number" className="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs mt-1" placeholder="5.00" value={invItemForm.purchase_price} onChange={e => setInvItemForm(p => ({...p, purchase_price: e.target.value}))} /></div>
+                  <div><label className="text-[10px] text-gray-500">Qty</label><input type="number" className="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs mt-1" value={invItemForm.quantity_purchased} onChange={e => setInvItemForm(p => ({...p, quantity_purchased: e.target.value}))} /></div>
+                  <div><label className="text-[10px] text-gray-500">Source</label><input className="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs mt-1" placeholder="Goodwill" value={invItemForm.source_name} onChange={e => setInvItemForm(p => ({...p, source_name: e.target.value}))} /></div>
+                  <div><label className="text-[10px] text-gray-500">List Price ($)</label><input type="number" className="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs mt-1" placeholder="19.99" value={invItemForm.list_price} onChange={e => setInvItemForm(p => ({...p, list_price: e.target.value}))} /></div>
+                </div>
+                <div className="flex justify-end"><button onClick={saveInvItem} className="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-500 rounded-lg text-xs font-medium">Save Item</button></div>
+              </div>
+            )}
+
+            {/* Purchase batch list */}
+            {batches.length > 0 && (
+              <div className="mb-6">
+                <div className="text-xs font-bold text-amber-400 uppercase tracking-wider mb-2">Purchase Batches</div>
+                <div className="bg-[#111827] border border-gray-800 rounded-xl overflow-hidden">
+                  {batches.map((b: any) => (
+                    <div key={b.id} className="flex items-center px-4 py-2.5 border-b border-gray-800/50 hover:bg-gray-800/30">
+                      <span className="text-xs font-mono text-gray-500 w-24">{b.batch_date}</span>
+                      <span className="text-sm flex-1">{b.source_name || b.source_type}</span>
+                      <span className="text-xs text-gray-500 w-16 text-right">{b.item_count} items</span>
+                      <span className="text-sm font-mono font-semibold text-amber-400 w-24 text-right">{fmt(Number(b.total_cost))}</span>
+                      <span className="text-[10px] text-gray-600 w-20 text-right">{b.payment_method}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Inventory items list */}
+            {invItems.length > 0 && (
+              <div>
+                <div className="text-xs font-bold text-indigo-400 uppercase tracking-wider mb-2">Inventory Items</div>
+                <div className="bg-[#111827] border border-gray-800 rounded-xl overflow-hidden">
+                  <div className="grid grid-cols-8 gap-0 px-4 py-2 border-b border-gray-700 text-[10px] font-bold text-gray-500">
+                    <span>Date</span><span className="col-span-2">Title</span><span>SKU</span><span>Cost</span><span>List</span><span>Source</span><span>Status</span>
+                  </div>
+                  {invItems.slice(0, 50).map((item: any) => (
+                    <div key={item.id} className="grid grid-cols-8 gap-0 px-4 py-1.5 border-b border-gray-800/30 text-xs">
+                      <span className="font-mono text-gray-500">{item.purchase_date?.slice(5)}</span>
+                      <span className="col-span-2 text-gray-300 truncate">{item.title}</span>
+                      <span className="font-mono text-indigo-400 truncate">{item.sku}</span>
+                      <span className="font-mono">{fmt(Number(item.purchase_price))}</span>
+                      <span className="font-mono text-gray-400">{item.list_price ? fmt(Number(item.list_price)) : "—"}</span>
+                      <span className="text-gray-500 truncate">{item.source_name || item.source}</span>
+                      <span className={`text-[10px] ${item.status === 'sold' ? 'text-emerald-400' : item.status === 'at_fba' ? 'text-blue-400' : 'text-gray-500'}`}>{item.status}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {invItems.length === 0 && batches.length === 0 && !showInvForm && !showBatchForm && (
+              <div className="text-center py-16 text-gray-500 text-sm">No inventory tracked yet. Click "Add Batch" for a sourcing trip, or "Add Item" for individual products.</div>
+            )}
+          </div>
+        )}
+
+        {/* ── PURCHASES TAB ───────────────────────────── */}
+        {tab === "purchases" && (
+          <div>
+            <div className="flex justify-between items-center mb-4">
+              <div>
+                <h2 className="text-lg font-bold">Purchase Tracking</h2>
+                <p className="text-sm text-gray-500">Track sourcing trips and purchases for COGS calculation</p>
+              </div>
+              <button onClick={() => setShowPoForm(!showPoForm)} className="px-4 py-2 bg-amber-600 hover:bg-amber-500 rounded-lg text-sm font-medium transition">
+                <Plus size={14} className="inline mr-1" />{showPoForm ? "Cancel" : "Log Purchase"}
+              </button>
+            </div>
+
+            {/* Summary cards */}
+            {purchases.length > 0 && (
+              <div className="grid grid-cols-4 gap-3 mb-4">
+                <MetricCard label="TOTAL TRIPS" value={String(purchases.length)} color="text-amber-400" />
+                <MetricCard label="TOTAL SPENT" value={fmt(purchases.reduce((s: number, p: any) => s + Number(p.total), 0))} color="text-red-400" />
+                <MetricCard label="AVG PER TRIP" value={fmt(purchases.reduce((s: number, p: any) => s + Number(p.total), 0) / (purchases.length || 1))} color="text-indigo-400" />
+                <MetricCard label="THIS MONTH" value={fmt(purchases.filter((p: any) => p.purchase_date?.startsWith(new Date().toISOString().slice(0, 7))).reduce((s: number, p: any) => s + Number(p.total), 0))} color="text-emerald-400" />
+              </div>
+            )}
+
+            {/* Add purchase form */}
+            {showPoForm && (
+              <div className="bg-[#111827] border border-gray-800 rounded-xl p-4 mb-4">
+                <div className="text-xs font-bold text-amber-400 uppercase mb-3">New Purchase / Sourcing Trip</div>
+                <div className="grid grid-cols-4 gap-3 mb-3">
+                  <div><label className="text-[10px] text-gray-500">Date</label><input type="date" className="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs mt-1" value={poForm.purchase_date} onChange={e => setPoForm(p => ({...p, purchase_date: e.target.value}))} /></div>
+                  <div><label className="text-[10px] text-gray-500">Vendor / Store</label><input className="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs mt-1" placeholder="Goodwill Henderson" value={poForm.vendor} onChange={e => setPoForm(p => ({...p, vendor: e.target.value}))} /></div>
+                  <div><label className="text-[10px] text-gray-500">Source Type</label>
+                    <select className="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs mt-1" value={poForm.source_type} onChange={e => setPoForm(p => ({...p, source_type: e.target.value}))}>
+                      <option value="thrift">Thrift Store</option><option value="library">Library Sale</option><option value="wholesale">Wholesale</option><option value="online_arbitrage">Online Arbitrage</option><option value="retail_arbitrage">Retail Arbitrage</option><option value="liquidation">Liquidation</option><option value="other">Other</option>
+                    </select></div>
+                  <div><label className="text-[10px] text-gray-500">Payment Method</label>
+                    <select className="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs mt-1" value={poForm.payment_method} onChange={e => setPoForm(p => ({...p, payment_method: e.target.value}))}>
+                      <option value="credit_card">Credit Card</option><option value="debit">Debit Card</option><option value="cash">Cash</option><option value="check">Check</option>
+                    </select></div>
+                </div>
+                <div className="grid grid-cols-4 gap-3 mb-3">
+                  <div><label className="text-[10px] text-gray-500">Subtotal ($)</label><input type="number" className="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs mt-1" placeholder="100.00" value={poForm.subtotal} onChange={e => setPoForm(p => ({...p, subtotal: e.target.value}))} /></div>
+                  <div><label className="text-[10px] text-gray-500">Tax ($)</label><input type="number" className="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs mt-1" placeholder="8.25" value={poForm.tax} onChange={e => setPoForm(p => ({...p, tax: e.target.value}))} /></div>
+                  <div className="col-span-2"><label className="text-[10px] text-gray-500">Notes</label><input className="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs mt-1" placeholder="25 books, 3 games" value={poForm.notes} onChange={e => setPoForm(p => ({...p, notes: e.target.value}))} /></div>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-xs text-gray-500">Total: {fmt((parseFloat(poForm.subtotal) || 0) + (parseFloat(poForm.tax) || 0))}</span>
+                  <button onClick={async () => {
+                    if (!user || !poForm.vendor) return;
+                    const total = (parseFloat(poForm.subtotal) || 0) + (parseFloat(poForm.tax) || 0);
+                    await supabase.from("purchase_orders").insert({
+                      user_id: user.id, vendor: poForm.vendor, purchase_date: poForm.purchase_date,
+                      source_type: poForm.source_type, subtotal: parseFloat(poForm.subtotal) || 0,
+                      tax: parseFloat(poForm.tax) || 0, total, payment_method: poForm.payment_method, notes: poForm.notes,
+                    });
+                    setShowPoForm(false);
+                    setPoForm({ vendor: "", purchase_date: new Date().toISOString().slice(0, 10), source_type: "thrift", subtotal: "", tax: "", payment_method: "credit_card", notes: "" });
+                    const { data } = await supabase.from("purchase_orders").select("*").eq("user_id", user.id).order("purchase_date", { ascending: false }).limit(100);
+                    if (data) setPurchases(data);
+                  }} className="px-4 py-1.5 bg-amber-600 hover:bg-amber-500 rounded-lg text-xs font-medium">Save Purchase</button>
+                </div>
+              </div>
+            )}
+
+            {/* Purchase list */}
+            {purchases.length > 0 ? (
+              <div className="bg-[#111827] border border-gray-800 rounded-xl overflow-hidden">
+                <div className="grid grid-cols-7 gap-0 px-4 py-2 border-b border-gray-700 text-[10px] font-bold text-gray-500">
+                  <span>Date</span><span>Vendor</span><span>Source</span><span className="text-right">Subtotal</span><span className="text-right">Tax</span><span className="text-right">Total</span><span>Payment</span>
+                </div>
+                {purchases.map((po: any) => (
+                  <div key={po.id} className="grid grid-cols-7 gap-0 px-4 py-2 border-b border-gray-800/30 text-xs hover:bg-gray-800/20">
+                    <span className="font-mono text-gray-500">{po.purchase_date}</span>
+                    <span className="text-gray-300">{po.vendor}</span>
+                    <span className="text-gray-500 capitalize">{po.source_type?.replace(/_/g, ' ')}</span>
+                    <span className="text-right font-mono">{fmt(Number(po.subtotal))}</span>
+                    <span className="text-right font-mono text-gray-500">{fmt(Number(po.tax))}</span>
+                    <span className="text-right font-mono font-semibold text-amber-400">{fmt(Number(po.total))}</span>
+                    <span className="text-gray-500 capitalize">{po.payment_method?.replace(/_/g, ' ')}</span>
+                  </div>
+                ))}
+                <div className="grid grid-cols-7 gap-0 px-4 py-2 border-t-2 border-gray-700 text-xs font-bold">
+                  <span></span><span className="text-amber-400">TOTALS</span><span></span>
+                  <span className="text-right font-mono">{fmt(purchases.reduce((s: number, p: any) => s + Number(p.subtotal), 0))}</span>
+                  <span className="text-right font-mono text-gray-500">{fmt(purchases.reduce((s: number, p: any) => s + Number(p.tax), 0))}</span>
+                  <span className="text-right font-mono text-amber-400">{fmt(purchases.reduce((s: number, p: any) => s + Number(p.total), 0))}</span>
+                  <span></span>
+                </div>
+              </div>
+            ) : !showPoForm ? (
+              <div className="text-center py-16 text-gray-500 text-sm">No purchases logged yet. Click "Log Purchase" to track sourcing trips, thrift store buys, and wholesale orders. These feed directly into your COGS calculation on the P&L.</div>
+            ) : null}
+          </div>
+        )}
+
+        {/* ── MILEAGE TAB ────────────────────────────── */}
+        {tab === "mileage" && (
+          <div>
+            <div className="flex justify-between items-center mb-4">
+              <div>
+                <h2 className="text-lg font-bold">Mileage Tracker</h2>
+                <p className="text-sm text-gray-500">
+                  {mileageSummary ? `${mileageSummary.total_trips} trips · ${Number(mileageSummary.total_miles).toLocaleString()} miles · ${fmt(Number(mileageSummary.total_deduction))} deduction (${mileageSummary.irs_rate_used}/mi)` : "Track business mileage for Schedule C Line 9"}
+                </p>
+              </div>
+              <button onClick={() => setShowMileageForm(!showMileageForm)} className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 rounded-lg text-sm font-medium transition">
+                <Plus size={14} className="inline mr-1" />{showMileageForm ? "Cancel" : "Log Trip"}
+              </button>
+            </div>
+
+            {/* Summary card */}
+            {mileageSummary && (
+              <div className="grid grid-cols-4 gap-3 mb-4">
+                <MetricCard label="TOTAL TRIPS" value={String(mileageSummary.total_trips)} color="text-indigo-400" />
+                <MetricCard label="TOTAL MILES" value={Number(mileageSummary.total_miles).toLocaleString()} color="text-blue-400" />
+                <MetricCard label="TAX DEDUCTION" value={fmt(Number(mileageSummary.total_deduction))} color="text-emerald-400" sub={`@ $${mileageSummary.irs_rate_used}/mile`} />
+                <MetricCard label="IRS RATE (2025)" value="$0.70/mi" color="text-gray-400" sub="Schedule C Line 9" />
+              </div>
+            )}
+
+            {/* Add mileage form */}
+            {showMileageForm && (
+              <div className="bg-[#111827] border border-gray-800 rounded-xl p-4 mb-4">
+                <div className="text-xs font-bold text-indigo-400 uppercase mb-3">Log Business Trip</div>
+                <div className="grid grid-cols-4 gap-3 mb-3">
+                  <div><label className="text-[10px] text-gray-500">Date</label><input type="date" className="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs mt-1" value={mileageForm.trip_date} onChange={e => setMileageForm(p => ({...p, trip_date: e.target.value}))} /></div>
+                  <div><label className="text-[10px] text-gray-500">Purpose</label>
+                    <select className="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs mt-1" value={mileageForm.purpose} onChange={e => setMileageForm(p => ({...p, purpose: e.target.value}))}>
+                      <option value="sourcing">Sourcing Trip</option><option value="post_office">Post Office / Shipping</option><option value="supply_run">Supply Run</option><option value="meeting">Business Meeting</option><option value="fba_prep">FBA Prep Center</option><option value="other">Other Business</option>
+                    </select></div>
+                  <div><label className="text-[10px] text-gray-500">Miles (one way)</label><input type="number" className="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs mt-1" placeholder="12.5" value={mileageForm.miles} onChange={e => setMileageForm(p => ({...p, miles: e.target.value}))} /></div>
+                  <div className="flex items-end pb-1">
+                    <label className="flex items-center gap-2 text-xs text-gray-400">
+                      <input type="checkbox" checked={mileageForm.is_round_trip} onChange={e => setMileageForm(p => ({...p, is_round_trip: e.target.checked}))} />
+                      Round trip (×2)
+                    </label>
+                  </div>
+                </div>
+                <div className="grid grid-cols-3 gap-3 mb-3">
+                  <div><label className="text-[10px] text-gray-500">From</label><input className="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs mt-1" placeholder="Home" value={mileageForm.from_location} onChange={e => setMileageForm(p => ({...p, from_location: e.target.value}))} /></div>
+                  <div><label className="text-[10px] text-gray-500">To</label><input className="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs mt-1" placeholder="Goodwill Henderson" value={mileageForm.to_location} onChange={e => setMileageForm(p => ({...p, to_location: e.target.value}))} /></div>
+                  <div><label className="text-[10px] text-gray-500">Notes</label><input className="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs mt-1" value={mileageForm.notes} onChange={e => setMileageForm(p => ({...p, notes: e.target.value}))} /></div>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-xs text-gray-500">{mileageForm.miles ? `Deduction: ${fmt(parseFloat(mileageForm.miles) * (mileageForm.is_round_trip ? 2 : 1) * 0.70)}` : ""}</span>
+                  <button onClick={saveMileage} className="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-500 rounded-lg text-xs font-medium">Save Trip</button>
+                </div>
+              </div>
+            )}
+
+            {/* Mileage log list */}
+            {mileageLogs.length > 0 ? (
+              <div className="bg-[#111827] border border-gray-800 rounded-xl overflow-hidden">
+                <div className="grid grid-cols-7 gap-0 px-4 py-2 border-b border-gray-700 text-[10px] font-bold text-gray-500">
+                  <span>Date</span><span>Purpose</span><span>From</span><span>To</span><span className="text-right">Miles</span><span className="text-right">Rate</span><span className="text-right">Deduction</span>
+                </div>
+                {mileageLogs.map((log: any) => (
+                  <div key={log.id} className="grid grid-cols-7 gap-0 px-4 py-2 border-b border-gray-800/30 text-xs">
+                    <span className="font-mono text-gray-500">{log.trip_date}</span>
+                    <span className="text-gray-300 capitalize">{log.purpose?.replace(/_/g, ' ')}</span>
+                    <span className="text-gray-500 truncate">{log.from_location || "—"}</span>
+                    <span className="text-gray-500 truncate">{log.to_location || "—"}</span>
+                    <span className="text-right font-mono">{Number(log.miles).toFixed(1)}{log.is_round_trip ? " (RT)" : ""}</span>
+                    <span className="text-right font-mono text-gray-500">${log.irs_rate}</span>
+                    <span className="text-right font-mono font-semibold text-emerald-400">{fmt(Number(log.miles) * Number(log.irs_rate))}</span>
+                  </div>
+                ))}
+              </div>
+            ) : !showMileageForm ? (
+              <div className="text-center py-16 text-gray-500 text-sm">No mileage logged yet. Click "Log Trip" to start tracking business miles for your Schedule C deduction.</div>
+            ) : null}
           </div>
         )}
 
